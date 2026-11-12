@@ -17,18 +17,25 @@ export function normalizeBranch(branch: string | null | undefined): string {
   return (branch ?? '').replace(/^refs\/heads\//, '')
 }
 
+// Where a terminal on the host opens. `name` is the local workspace's name; SSH anchors have only the path.
+export type Anchor = { path: string; workspaceId?: string; name?: string }
+// Why there is none: Orca's workspace listing of the SSH host failed, read once more (unreachable), or the host has no
+// workspace in Orca, including a listing that does not cover it (no-workspace). This Mac without one is always
+// no-workspace.
+export type NoAnchor = { missing: 'unreachable' | 'no-workspace' }
+
 export type Hosts = {
   list(refresh?: boolean): Promise<HostInfo[]>
   // This Mac's entry, from the platform alone: no Orca CLI call, so a failing SSH listing never delays local Docker.
   localHost(): HostInfo
   matchFocus(focus: FocusContext): Promise<HostId | null>
-  // `name` is the local workspace's name; SSH anchors have only the path.
-  anchor(hostId: HostId, focus: FocusContext | null): Promise<{ path: string; workspaceId?: string; name?: string } | null>
+  anchor(hostId: HostId, focus: FocusContext | null): Promise<Anchor | NoAnchor>
   remember(hostId: HostId, path: string): Promise<void>
 }
 
 type Worktree = { path: string; displayName: string; branch: string }
-// What the last read of one SSH host gave: its rows, or null when the read failed.
+// What the last read of one SSH host gave: its rows, or null when the read failed. A listing that answered without
+// covering the host (host_not_covered: Orca is connected but has no repo there) reads as no rows.
 type Read = Worktree[] | null
 // listed: the SSH host list came from the CLI (false: listing failed and only this Mac is shown).
 type Snapshot = { at: number; envs: string[]; reads: Map<string, Read>; listed: boolean }
@@ -45,6 +52,18 @@ export function createHosts(deps: HostsDeps): Hosts {
   // The SSH host listing is failing. A failed list is not cached, so each call asks again; the log gets one line per outage.
   let listingDown = false
 
+  // One host's workspace listing. lastKnown keeps only rows a covering listing returned.
+  async function readHost(env: string): Promise<Read> {
+    try {
+      const rows = await cli.listWorktrees(env, { timeoutMs: LISTING_TIMEOUT_MS })
+      lastKnown.set(env, rows)
+      return rows
+    } catch (error) {
+      if (!(error instanceof CliError)) throw error
+      return error.code === 'host_not_covered' ? [] : null
+    }
+  }
+
   // A CLI failure listing the SSH hosts leaves this Mac alone: the list is local-only until the next read.
   async function compute(refresh: boolean): Promise<Snapshot> {
     let envs: string[]
@@ -60,16 +79,7 @@ export function createHosts(deps: HostsDeps): Hosts {
     listingDown = !listed
     if (refresh) await Promise.all(envs.map((env) => storage.delete(kernelKey(env))))
     const reads = new Map<string, Read>()
-    await Promise.all(envs.map(async (env) => {
-      try {
-        const rows = await cli.listWorktrees(env, { timeoutMs: LISTING_TIMEOUT_MS })
-        reads.set(env, rows)
-        lastKnown.set(env, rows)
-      } catch (error) {
-        if (!(error instanceof CliError)) throw error
-        reads.set(env, null)
-      }
-    }))
+    await Promise.all(envs.map(async (env) => { reads.set(env, await readHost(env)) }))
     return { at: deps.now(), envs, reads, listed }
   }
 
@@ -85,7 +95,8 @@ export function createHosts(deps: HostsDeps): Hosts {
     ({ id: 'local', label: 'This Mac', kind: 'local', status: isSupportedLocalPlatform(deps.platform) ? 'ready' : 'unsupported' })
 
   // Status is derived on every call: a kernel recorded by an ssh run shows up without a new read.
-  // Off a supported local platform nothing is tried, SSH hosts included (spec 2.1).
+  // Off a supported local platform nothing is tried, SSH hosts included (spec 2.1). Orca's workspace listing of a
+  // host does not count: whether ssh reaches it shows in each request's answer.
   async function hostsOf(snap: Snapshot): Promise<HostInfo[]> {
     const local = localHost()
     const supported = local.status === 'ready'
@@ -93,10 +104,7 @@ export function createHosts(deps: HostsDeps): Hosts {
       const info = (status: HostStatus): HostInfo => ({ id: `ssh:${env}`, label: env, kind: 'ssh', status })
       if (!supported) return info('unsupported')
       const kernel = await storage.get(kernelKey(env))
-      if (typeof kernel === 'string' && !isSupportedRemoteKernel(kernel)) return info('unsupported')
-      const rows = snap.reads.get(env)
-      if (!rows) return info('unreachable')
-      return info(rows.length === 0 ? 'no-workspace' : 'ready')
+      return info(typeof kernel === 'string' && !isSupportedRemoteKernel(kernel) ? 'unsupported' : 'ready')
     }))
     return [local, ...ssh]
   }
@@ -156,10 +164,18 @@ export function createHosts(deps: HostsDeps): Hosts {
     matchFocus,
     async anchor(hostId, focus) {
       const env = envOf(hostId)
-      if (env === null) return localHost().status === 'ready' ? localAnchor(focus) : null
+      if (env === null) return (localHost().status === 'ready' ? await localAnchor(focus) : null) ?? { missing: 'no-workspace' }
+      // Only the latest read counts (not lastKnown): while Orca cannot list the host it cannot open a terminal there.
+      // A failed read may be as old as the host list cache, so it is read once more first, and what that read gives
+      // is kept as compute would keep it. A host Orca does not list is not read.
+      // The host's status is not checked here; the service refuses unknown and unsupported hosts first.
       const snap = await snapshot()
-      if ((await hostsOf(snap)).find((h) => h.id === hostId)?.status !== 'ready') return null
-      const rows = snap.reads.get(env) ?? []
+      let rows = snap.reads.get(env)
+      if (rows === null) {
+        rows = await readHost(env)
+        snap.reads.set(env, rows)
+      }
+      if (!rows) return { missing: 'unreachable' }
       // A same-name workspace on another host must not decide: the focused row counts only when its name is on this
       // host alone. Unlike matchFocus no local terminal lookup: a focused local terminal could only point away from
       // this host.
@@ -169,7 +185,7 @@ export function createHosts(deps: HostsDeps): Hosts {
       const remembered = await storage.get(anchorKey(env))
       const kept = typeof remembered === 'string' ? rows.find((w) => w.path === remembered) : undefined
       if (kept) return { path: kept.path }
-      return rows[0] ? { path: rows[0].path } : null
+      return rows[0] ? { path: rows[0].path } : { missing: 'no-workspace' }
     },
     async remember(hostId, path) {
       const env = envOf(hostId)

@@ -15,16 +15,21 @@ function memoryStore() {
   return { store, data }
 }
 
+// unreachable: the listing fails (remote_runtime_unavailable: Orca's runtime on that host is down). notCovered: Orca answers without
+// covering the host (host_not_covered: connected, but no repo there).
 class HostCli extends FakeCli {
   unreachable = new Set<string>()
+  notCovered = new Set<string>()
   crash = false
   override async listWorktrees(environment: string, options?: CallOptions) {
     const rows = await super.listWorktrees(environment, options)
     if (this.crash) throw new TypeError('boom')
     if (this.unreachable.has(environment)) throw new CliError('remote_runtime_unavailable', 'down')
+    if (this.notCovered.has(environment)) throw new CliError('host_not_covered', `Orca could not cover host ${environment}`)
     return rows
   }
 }
+const readsOf = (cli: FakeCli, env: string) => cli.calls.filter((c) => c.method === 'listWorktrees' && c.environment === env).length
 
 const LOCAL_WS: LocalWorkspace[] = [
   { id: 'identity:wt2:local:1', name: 'main', path: '/Users/me/orca-docker', branch: 'main' },
@@ -62,13 +67,15 @@ describe('hosts', () => {
     assert.equal(normalizeBranch('dev'), 'dev')
   })
 
-  test('lists local and ssh-tunnel hosts with their status', async () => {
+  // Orca's workspace listing does not decide whether an SSH host can be used: ssh does. GPU2's listing fails and
+  // cloud-gpu lists no workspace, and both are ready.
+  test('lists local and SSH hosts; a failed or empty workspace listing leaves an SSH host ready', async () => {
     const { hosts } = setup()
     assert.deepEqual(await hosts.list(), [
       { id: 'local', label: 'This Mac', kind: 'local', status: 'ready' },
       { id: 'ssh:GPU1', label: 'GPU1', kind: 'ssh', status: 'ready' },
-      { id: 'ssh:GPU2', label: 'GPU2', kind: 'ssh', status: 'unreachable' },
-      { id: 'ssh:cloud-gpu', label: 'cloud-gpu', kind: 'ssh', status: 'no-workspace' },
+      { id: 'ssh:GPU2', label: 'GPU2', kind: 'ssh', status: 'ready' },
+      { id: 'ssh:cloud-gpu', label: 'cloud-gpu', kind: 'ssh', status: 'ready' },
     ])
   })
 
@@ -82,7 +89,7 @@ describe('hosts', () => {
     assert.equal(listing.asks, 0)
     const linux = setup({ platform: 'linux' })
     assert.deepEqual(linux.hosts.localHost(), { id: 'local', label: 'This Mac', kind: 'local', status: 'unsupported' })
-    assert.equal(await linux.hosts.anchor('local', null), null)
+    assert.deepEqual(await linux.hosts.anchor('local', null), { missing: 'no-workspace' })
     assert.deepEqual(linux.cli.calls, [])
   })
 
@@ -97,7 +104,6 @@ describe('hosts', () => {
     assert.deepEqual((await hosts.list()).map((h) => [h.id, h.status]), [
       ['local', 'unsupported'], ['ssh:GPU1', 'unsupported'], ['ssh:GPU2', 'unsupported'], ['ssh:cloud-gpu', 'unsupported'],
     ])
-    assert.equal(await hosts.anchor('ssh:GPU1', null), null)
   })
 
   test('a recorded non-Linux kernel makes the host unsupported at once, until refresh', async () => {
@@ -110,6 +116,17 @@ describe('hosts', () => {
     assert.equal(reads(), before)
     assert.equal((await hosts.list(true)).find((h) => h.id === 'ssh:GPU1')?.status, 'ready')
     assert.equal(mem.data.has(kernelKey('GPU1')), false)
+  })
+
+  // The kernel decides whatever Orca's listing says: a failed listing (GPU2) or an empty one (cloud-gpu) too.
+  test('a stored Darwin kernel makes an SSH host unsupported, whether its listing failed, was empty or not', async () => {
+    const { hosts, mem } = setup()
+    for (const env of ['GPU1', 'GPU2', 'cloud-gpu']) await mem.store.set(kernelKey(env), 'Darwin')
+    assert.deepEqual((await hosts.list()).map((h) => [h.id, h.status]), [
+      ['local', 'ready'], ['ssh:GPU1', 'unsupported'], ['ssh:GPU2', 'unsupported'], ['ssh:cloud-gpu', 'unsupported'],
+    ])
+    await mem.store.set(kernelKey('GPU2'), 'Linux')
+    assert.equal((await hosts.list()).find((h) => h.id === 'ssh:GPU2')?.status, 'ready')
   })
 
   test('prefers a local terminal id over a unique name match', async () => {
@@ -141,8 +158,25 @@ describe('hosts', () => {
     // Local anchors carry the workspace name for the "Opened … in …" line (ruling I2).
     assert.deepEqual(await hosts.anchor('local', focus('other')), { path: '/Users/me/other', workspaceId: 'identity:wt2:local:2', name: 'other' })
     assert.deepEqual(await hosts.anchor('local', null), { path: '/Users/me/orca-docker', workspaceId: 'identity:wt2:local:1', name: 'main' })
-    assert.equal(await hosts.anchor('ssh:cloud-gpu', null), null)
-    assert.equal(await hosts.anchor('ssh:GPU2', null), null)
+  })
+
+  // Only Shell / Open in terminal need an anchor; the service tells the person why there is none.
+  test('tells why there is no anchor: unreachable when the host listing failed, no-workspace when it listed none', async () => {
+    const { hosts, cli } = setup()
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', focus('a5')), { missing: 'unreachable' })
+    assert.deepEqual(await hosts.anchor('ssh:cloud-gpu', null), { missing: 'no-workspace' })
+    await hosts.remember('ssh:cloud-gpu', '/home/me/old')
+    assert.deepEqual(await hosts.anchor('ssh:cloud-gpu', null), { missing: 'no-workspace' })
+    // The latest read counts: rows known from an earlier read do not make an anchor while the listing fails.
+    cli.unreachable.add('GPU1')
+    await hosts.list(true)
+    assert.deepEqual(await hosts.anchor('ssh:GPU1', focus('x')), { missing: 'unreachable' })
+    cli.unreachable.delete('GPU2')
+    await hosts.list(true)
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', null), { path: '/home/me/a5' })
+    // This Mac with no workspace is no-workspace (a failing local list too: see its own test below).
+    const none = setup({ localWorkspaces: [] })
+    assert.deepEqual(await none.hosts.anchor('local', null), { missing: 'no-workspace' })
   })
 
   // Ruling I1: a same-name workspace on another host must not pick this host's anchor.
@@ -289,8 +323,75 @@ describe('hosts', () => {
     assert.equal(await hosts.matchFocus(focus('main', 'main', ['term_y'])), null)
   })
 
+  // Orca is connected but the listing does not cover the host. That is no workspace, not unreachable.
+  test('a listing that does not cover the host reads as empty: no-workspace, and last known rows are kept', async () => {
+    const { hosts, cli } = setup()
+    await hosts.list()
+    cli.notCovered.add('GPU1')
+    assert.equal((await hosts.list(true)).find((h) => h.id === 'ssh:GPU1')?.status, 'ready')
+    const before = readsOf(cli, 'GPU1')
+    assert.deepEqual(await hosts.anchor('ssh:GPU1', focus('x')), { missing: 'no-workspace' })
+    assert.equal(readsOf(cli, 'GPU1'), before) // an empty read is not read again
+    // lastKnown still has GPU1's rows from the first read: the focus on 'x' still resolves to GPU1.
+    assert.equal(await hosts.matchFocus(focus('x')), 'ssh:GPU1')
+    // Any other CliError is a failed read: unreachable.
+    cli.notCovered.delete('GPU1')
+    cli.unreachable.add('GPU1')
+    await hosts.list(true)
+    assert.deepEqual(await hosts.anchor('ssh:GPU1', focus('x')), { missing: 'unreachable' })
+  })
+
+  // A failed read can be up to five minutes old (the host list cache): Orca may have reconnected since.
+  test('before answering unreachable, anchor reads that host once more and keeps what it reads', async () => {
+    const { hosts, cli } = setup()
+    await hosts.list()
+    const before = readsOf(cli, 'GPU2')
+    // Still failing: one more read, then unreachable.
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', null), { missing: 'unreachable' })
+    assert.equal(readsOf(cli, 'GPU2'), before + 1)
+    // Recovered: the read is used and cached, and it becomes the host's last known rows.
+    cli.unreachable.delete('GPU2')
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', focus('a5')), { path: '/home/me/a5' })
+    assert.equal(readsOf(cli, 'GPU2'), before + 2)
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', null), { path: '/home/me/a5' })
+    assert.equal(await hosts.matchFocus(focus('a5')), 'ssh:GPU2')
+    assert.equal(readsOf(cli, 'GPU2'), before + 2)
+    const listings = cli.calls.filter((c) => c.method === 'listWorktrees')
+    assert.ok(listings.every((c) => 'timeoutMs' in c && c.timeoutMs === 10_000), JSON.stringify(listings))
+  })
+
+  test('the re-read can find the host not covered: no-workspace', async () => {
+    const { hosts, cli } = setup()
+    await hosts.list()
+    cli.unreachable.delete('GPU2')
+    cli.notCovered.add('GPU2')
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', null), { missing: 'no-workspace' })
+    assert.deepEqual(await hosts.anchor('ssh:GPU2', null), { missing: 'no-workspace' })
+    assert.equal(readsOf(cli, 'GPU2'), 2) // the list's read and one re-read
+  })
+
+  test('only a failed read is read again: a good or empty read, or a host Orca does not list, is not', async () => {
+    const { hosts, cli } = setup()
+    await hosts.list()
+    const total = () => cli.calls.filter((c) => c.method === 'listWorktrees').length
+    const before = total()
+    assert.deepEqual(await hosts.anchor('ssh:GPU1', null), { path: '/home/me/main' })
+    assert.deepEqual(await hosts.anchor('ssh:cloud-gpu', null), { missing: 'no-workspace' })
+    assert.deepEqual(await hosts.anchor('ssh:nope', null), { missing: 'unreachable' })
+    assert.equal(total(), before)
+  })
+
   test('hosts that were never readable do not block auto-follow', async () => {
     const { hosts } = setup()
+    assert.equal(await hosts.matchFocus(focus('x')), 'ssh:GPU1')
+  })
+
+  // A host whose listing fails is still ready (ssh decides), so its last known rows can still be followed.
+  test('follows a host whose listing now fails, from its last known rows', async () => {
+    const { hosts, cli } = setup()
+    await hosts.list()
+    cli.unreachable.add('GPU1')
+    assert.equal((await hosts.list(true)).find((h) => h.id === 'ssh:GPU1')?.status, 'ready')
     assert.equal(await hosts.matchFocus(focus('x')), 'ssh:GPU1')
   })
 
@@ -301,18 +402,25 @@ describe('hosts', () => {
     assert.equal(await hosts.matchFocus(focus('other')), null)
   })
 
-  test('a failing local workspace list makes matchFocus null and anchor(local) null', async () => {
+  test('a failing local workspace list makes matchFocus null and anchor(local) no-workspace', async () => {
     const { hosts, cli, local } = setup()
     local.fail = true
     assert.equal(await hosts.matchFocus(focus('x')), null)
-    assert.equal(await hosts.anchor('local', null), null)
+    assert.deepEqual(await hosts.anchor('local', null), { missing: 'no-workspace' })
     cli.localTerminals = [{ handle: 'term_x', worktreePath: '/p' }]
     assert.equal(await hosts.matchFocus(focus('x', '', ['term_x'])), 'local')
   })
 
-  test('only CliError means unreachable; other errors propagate', async () => {
+  test('only a CliError counts as a failed listing; other errors propagate', async () => {
     const { hosts, cli } = setup()
     cli.crash = true
     await assert.rejects(() => hosts.list(), (e: unknown) => e instanceof TypeError)
+  })
+
+  test('the one re-read before unreachable lets a non-CliError through too', async () => {
+    const { hosts, cli } = setup()
+    await hosts.list() // GPU2's listing fails with a CliError and is cached as a failed read
+    cli.crash = true
+    await assert.rejects(() => hosts.anchor('ssh:GPU2', null), (e: unknown) => e instanceof TypeError)
   })
 })

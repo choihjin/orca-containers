@@ -1,5 +1,5 @@
-import type { ContainerAction, FocusContext, HostId, HostStatus, Opened, Problem, Result, RunOptions, Snapshot, TerminalKind } from './protocol'
-import type { Hosts } from './hosts'
+import type { ContainerAction, FocusContext, HostId, Opened, Problem, Result, RunOptions, Snapshot, TerminalKind } from './protocol'
+import type { Anchor, Hosts, NoAnchor } from './hosts'
 import type { LocalRunner } from './local/runner'
 import { CliError, type OrcaCli } from './remote/orca-cli'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
@@ -25,7 +25,8 @@ export function terminalTitle(kind: TerminalKind, name: string): string {
   return `${kind}: ${cleanLabel(name, 40)}`
 }
 
-const STATUS_MESSAGE: Record<Exclude<HostStatus, 'ready'>, string> = {
+// The host problems the service answers itself: an unsupported host, and a terminal with no anchor.
+const MESSAGE: Record<'unsupported' | NoAnchor['missing'], string> = {
   unsupported: 'This host is not supported.',
   unreachable: 'Orca could not reach this host.',
   'no-workspace': 'This host has no workspace.',
@@ -53,20 +54,23 @@ function answerLines(lines: readonly string[]): string[] {
 
 export function createService(deps: ServiceDeps): Service {
   const { hosts, local, ssh, cli } = deps
-  type Anchor = { path: string; workspaceId?: string; name?: string }
 
-  // Unknown host -> invalid; a host that is not ready -> its status as the problem. This Mac is known from the platform
-  // alone; an SSH id needs the host list (one lookup: a failing CLI listing is not cached, so each one asks again).
+  // Unknown host -> invalid; unsupported -> unsupported. Nothing else: Orca's workspace listing of an SSH host does
+  // not stop a request, ssh answers for itself. This Mac is known from the platform alone; an SSH id needs the host
+  // list (one lookup: a failing CLI listing is not cached, so each one asks again).
   async function readyHost(hostId: HostId): Promise<Result<null>> {
     const info = envOf(hostId) === null ? hosts.localHost() : (await hosts.list()).find((h) => h.id === hostId)
     if (!info) return fail('invalid', 'Unknown host.')
-    return info.status === 'ready' ? { ok: true, value: null } : fail(info.status, STATUS_MESSAGE[info.status])
+    return info.status === 'ready' ? { ok: true, value: null } : fail('unsupported', MESSAGE.unsupported)
   }
 
-  // No anchor -> no-workspace.
+  // No anchor on an SSH host -> why (unreachable: Orca's listing of it failed; no-workspace: it has none). No anchor
+  // on this Mac -> no-workspace.
   async function anchorOf(hostId: HostId, focus: FocusContext | null): Promise<Result<Anchor>> {
     const anchor = await hosts.anchor(hostId, focus)
-    return anchor ? { ok: true, value: anchor } : fail('no-workspace', STATUS_MESSAGE['no-workspace'])
+    if (!('missing' in anchor)) return { ok: true, value: anchor }
+    const kind = envOf(hostId) === null ? 'no-workspace' : anchor.missing
+    return fail(kind, MESSAGE[kind])
   }
 
   // Runs on the host's own runner: docker on this Mac, or `ssh <host name>` from this Mac. Neither needs a workspace or
@@ -87,7 +91,7 @@ export function createService(deps: ServiceDeps): Service {
       kernel = undefined
     }
     if (typeof kernel === 'string') {
-      return isSupportedRemoteKernel(kernel) ? { ok: true, value: null } : fail('unsupported', STATUS_MESSAGE.unsupported)
+      return isSupportedRemoteKernel(kernel) ? { ok: true, value: null } : fail('unsupported', MESSAGE.unsupported)
     }
     const checked = await ssh.run(env, [], options)
     return checked.ok ? { ok: true, value: null } : checked
@@ -159,7 +163,7 @@ export function createService(deps: ServiceDeps): Service {
       const title = terminalTitle(kind, containerName)
       const env = envOf(hostId)
       if (env === null) {
-        if (anchor.workspaceId === undefined) return fail('no-workspace', STATUS_MESSAGE['no-workspace'])
+        if (anchor.workspaceId === undefined) return fail('no-workspace', MESSAGE['no-workspace'])
         const terminalId = await deps.openLocalTerminal({ workspaceId: anchor.workspaceId, title, command })
         await bringToFront({ handle: terminalId })
         return { ok: true, value: { opened: true, workspace: anchor.name ?? baseName(anchor.path) } }

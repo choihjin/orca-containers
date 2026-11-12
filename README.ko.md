@@ -39,6 +39,8 @@ Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너,
   로그인해야 합니다(예: ssh-agent에 올린 키). 확인하려면 이 Mac의 터미널에서
   `ssh -o BatchMode=yes <호스트 이름> true`를 실행해 보세요. 오류 없이 끝나야 합니다. 호스트 이름은 영문자, 숫자,
   `.`, `_`, `-`로 이루어지고 첫 글자가 영문자나 숫자여야 합니다. 그 밖의 이름은 ssh로 쓸 수 없습니다.
+- 목록, 동작, 패널 안의 로그에는 이 ssh 로그인만 있으면 됩니다. SSH 호스트에서 Shell과 **Open in terminal**을
+  쓰려면 Orca에 그 호스트의 워크스페이스가 있고, 그 호스트에 대한 Orca 자체 연결도 있어야 합니다.
 
 ## 설치
 
@@ -46,10 +48,10 @@ Orca에서 **Settings → Plugins**를 열고 **Add plugin → From a Git URL…
 저장소 주소를 붙여 넣어 설치합니다.
 
 ```text
-https://github.com/choihjin/orca-containers#v0.1.1
+https://github.com/choihjin/orca-containers#v0.1.2
 ```
 
-터미널에서는 `orca plugin install choihjin/orca-containers@v0.1.1`으로도 설치할 수 있습니다.
+터미널에서는 `orca plugin install choihjin/orca-containers@v0.1.2`으로도 설치할 수 있습니다.
 
 Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. 확인한 뒤 켜세요.
 
@@ -61,10 +63,13 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
   `~/.zlogin`)이 실행됩니다. 찾은 경로는 다시 쓰고, 찾지 못하는 동안은 새로 고칠 때마다 다시 실행합니다.
 - **SSH 호스트:** 목록, 동작, 패널 안의 로그는 이 Mac에서 `ssh <호스트 이름>`을 실행합니다. ssh 접속 대상은
   Orca 호스트 이름 그대로이고, 그 호스트의 `sh`에 정해진 스크립트를 보냅니다. 터미널은 열지 않습니다.
+  ssh만 있으면 되고, Orca가 그 호스트에 연결되는지나 그 호스트에 워크스페이스가 있는지는 상관없습니다.
   ssh는 `BatchMode=yes`로 실행하므로 비밀번호나 passphrase를 묻지 않습니다. 프롬프트 없이 로그인할 수 없는
   호스트에는 "SSH connection failed"와 함께 고칠 점이 표시됩니다. 60초가 지나도 끝나지 않은 ssh 실행은 멈춥니다.
 - **SSH 호스트의 터미널:** 터미널은 Shell과 **Open in terminal**을 누를 때만 열립니다. Orca 자체 명령줄
-  도구(`orca … --environment <호스트>`)로 그 호스트의 워크스페이스에 Orca 터미널을 엽니다.
+  도구(`orca … --environment <호스트>`)로 그 호스트의 워크스페이스에 Orca 터미널을 엽니다. 그래서 Orca에 그
+  호스트의 워크스페이스가 있고 그 호스트에 대한 Orca 자체 연결도 있어야 합니다. 그렇지 않으면 패널에 "Host
+  unreachable"(Orca가 호스트에 연결하지 못함)이나 "No workspace on this host"가 표시됩니다.
 
 ## 요청하는 권한
 

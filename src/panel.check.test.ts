@@ -12,7 +12,7 @@ afterEach(async () => {
 })
 
 test('every check scenario stubs exactly the six worker requests', () => {
-  assert.deepEqual(Object.keys(scenarios).sort(), ['daemonDown', 'empty', 'local', 'resources', 'ssh', 'unreachable'])
+  assert.deepEqual(Object.keys(scenarios).sort(), ['daemonDown', 'empty', 'local', 'resources', 'ssh', 'sshFailed'])
   for (const [name, scenario] of Object.entries(scenarios)) {
     const stubs = scenario.requests ?? {}
     assert.deepEqual(Object.keys(stubs).sort(), REQUEST_NAMES, name)
@@ -26,7 +26,7 @@ test('each check scenario draws the screen it is named for', async () => {
     local: { line: 'Tree "Containers": 2 top-level item(s)' },
     ssh: { line: 'Tree "Containers": 2 top-level item(s)' },
     daemonDown: { line: 'EmptyState "Docker is not running"' },
-    unreachable: { line: 'EmptyState "Host unreachable"' },
+    sshFailed: { line: 'EmptyState "SSH connection failed"' },
     empty: { text: 'No containers' },
     // This Mac with every section open, for the plugin page screenshots.
     resources: { line: 'Tree "Volumes": 1 top-level item(s)' },
@@ -42,6 +42,12 @@ test('each check scenario draws the screen it is named for', async () => {
       assert.deepEqual(view.expandedOf(tree), ['project:ml'])
       const items = (view.find(tree)?.props.items ?? []) as readonly { key: string; children?: readonly unknown[] }[]
       assert.deepEqual(items.map((i) => [i.key, i.children?.length]), [['project:ml', 2], ['456789abcdef', undefined]])
+    }
+    if (name === 'sshFailed') {
+      // GPU2 is ready and picked: the problem comes from ssh, not from the host list.
+      const select = view.find({ label: 'Host' })
+      assert.equal(select?.props.value, 'ssh:GPU2')
+      assert.deepEqual(select?.props.options, [{ value: 'local', label: 'This Mac' }, { value: 'ssh:GPU2', label: 'GPU2 (SSH)' }])
     }
     assert.deepEqual(view.errors, [], name)
     assert.deepEqual(view.refusals, [], name)

@@ -1,9 +1,10 @@
 import { assert, describe, test } from 'orca/testing'
-import type { ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Result } from './protocol'
-import type { Hosts } from './hosts'
+import type { ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Problem, Result } from './protocol'
+import { createHosts, type Anchor, type Hosts, type NoAnchor } from './hosts'
 import type { LocalRunner } from './local/runner'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
-import { CliError, type OrcaCli } from './remote/orca-cli'
+import { CliError, type CallOptions, type OrcaCli } from './remote/orca-cli'
+import { FakeCli } from './remote/fake-cli'
 import type { DockerCommand } from './docker/commands'
 import type { CommandResult } from './docker/parse'
 import { createService, terminalTitle } from './service'
@@ -22,7 +23,7 @@ const okResults = (): CommandResult[] => [
 ]
 
 // The kernel the last ssh run stored for host A: Linux unless a test says otherwise (null: none stored yet).
-function setup(opts: { status?: HostStatus; anchor?: { path: string; workspaceId?: string } | null; kernel?: string | null } = {}) {
+function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?: string | null } = {}) {
   const calls: string[] = []
   const log = {
     localRuns: [] as { commands: readonly DockerCommand[]; options: unknown }[],
@@ -176,23 +177,21 @@ describe('service', () => {
     assert.deepEqual(t.log.anchors, [])
   })
 
-  test('a host that is not ready answers its own problem without running anything', async () => {
-    for (const status of ['unsupported', 'unreachable', 'no-workspace'] as const) {
-      const t = setup({ status })
-      const r = await t.service.snapshot('ssh:A', OPTIONS)
-      assert.equal(!r.ok && r.problem.kind, status)
-      const a = await t.service.action('local', 'start', ID, OPTIONS)
-      assert.equal(!a.ok && a.problem.kind, status)
-      const o = await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS)
-      assert.equal(!o.ok && o.problem.kind, status)
-      assert.deepEqual(t.calls, [])
-    }
+  test('an unsupported host answers unsupported without running anything', async () => {
+    const t = setup({ status: 'unsupported' })
+    const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
+    assert.deepEqual(await t.service.snapshot('ssh:A', OPTIONS), unsupported)
+    assert.deepEqual(await t.service.action('local', 'start', ID, OPTIONS), unsupported)
+    assert.deepEqual(await t.service.logs('ssh:A', ID, OPTIONS), unsupported)
+    assert.deepEqual(await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS), unsupported)
+    assert.deepEqual(t.calls, [])
+    assert.deepEqual(t.log.anchors, [])
   })
 
   // Ruling R1: local Docker needs no workspace, so a local snapshot or action never looks one up (on this Mac that
   // costs an Orca CLI terminal list); a local Logs/Shell does. Over ssh only Logs/Shell terminals need one.
   test('only a terminal looks up a workspace: no lookup for a snapshot, action or logs on either host', async () => {
-    const t = setup({ anchor: null })
+    const t = setup({ anchor: { missing: 'no-workspace' } })
     assert.equal((await t.service.snapshot('local', OPTIONS)).ok, true)
     t.setLocal([{ name: 'action', code: 0, lines: [ID] }])
     assert.deepEqual(await t.service.action('local', 'start', ID, OPTIONS), { ok: true, value: { done: true } })
@@ -201,7 +200,7 @@ describe('service', () => {
     const opened = await t.service.openTerminal('local', 'logs', ID, 'web', FOCUS, OPTIONS)
     assert.equal(!opened.ok && opened.problem.kind, 'no-workspace')
     assert.deepEqual(t.log.anchors, [{ hostId: 'local', focus: FOCUS }])
-    const ssh = setup({ anchor: null })
+    const ssh = setup({ anchor: { missing: 'no-workspace' } })
     assert.equal((await ssh.service.snapshot('ssh:A', OPTIONS)).ok, true)
     ssh.setSsh({ ok: true, value: [{ name: 'action', code: 0, lines: [ID] }] })
     assert.equal((await ssh.service.action('ssh:A', 'stop', ID, OPTIONS)).ok, true)
@@ -213,12 +212,26 @@ describe('service', () => {
     assert.deepEqual(ssh.log.anchors, [{ hostId: 'ssh:A', focus: FOCUS }])
   })
 
-  test('a ready SSH host without an anchor still lists over ssh but opens no terminal', async () => {
-    const t = setup({ anchor: null })
-    assert.equal((await t.service.snapshot('ssh:A', OPTIONS)).ok, true)
-    const r = await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS)
-    assert.equal(!r.ok && r.problem.kind, 'no-workspace')
-    assert.deepEqual(t.log.order, ['ssh.run', 'anchor'])
+  test('a ready SSH host without an anchor still lists over ssh but opens no terminal, and says why', async () => {
+    const messages = { unreachable: 'Orca could not reach this host.', 'no-workspace': 'This host has no workspace.' }
+    for (const missing of ['unreachable', 'no-workspace'] as const) {
+      const t = setup({ anchor: { missing }, kernel: null })
+      assert.equal((await t.service.snapshot('ssh:A', OPTIONS)).ok, true)
+      const r = await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS)
+      assert.deepEqual(r, { ok: false, problem: { kind: missing, message: messages[missing] } })
+      assert.deepEqual(t.log.order, ['ssh.run', 'anchor'])
+      assert.deepEqual(t.log.created, [])
+    }
+  })
+
+  // A missing local anchor is no-workspace, whatever reason hosts gives.
+  test('a local terminal without an anchor is no-workspace', async () => {
+    for (const missing of ['unreachable', 'no-workspace'] as const) {
+      const t = setup({ anchor: { missing } })
+      const r = await t.service.openTerminal('local', 'shell', ID, 'web', FOCUS, OPTIONS)
+      assert.deepEqual(r, { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
+      assert.deepEqual(t.calls, [])
+    }
   })
 
   test('an unknown host id is invalid', async () => {
@@ -325,9 +338,9 @@ describe('service', () => {
       assert.equal(!r.ok && r.problem.kind, 'invalid')
     }
     assert.deepEqual(t.calls, [])
-    const down = setup({ status: 'unreachable' })
+    const down = setup({ status: 'unsupported' })
     const r = await down.service.logs('ssh:A', ID, OPTIONS)
-    assert.equal(!r.ok && r.problem.kind, 'unreachable')
+    assert.equal(!r.ok && r.problem.kind, 'unsupported')
     assert.deepEqual(down.calls, [])
   })
 
@@ -397,7 +410,7 @@ describe('service', () => {
   test('the kernel check comes after the container id and the workspace are known', async () => {
     const bad = setup({ kernel: null })
     assert.equal((await bad.service.openTerminal('ssh:A', 'shell', '$(id)', 'web', null, OPTIONS)).ok, false)
-    const noAnchor = setup({ kernel: null, anchor: null })
+    const noAnchor = setup({ kernel: null, anchor: { missing: 'no-workspace' } })
     assert.equal((await noAnchor.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, false)
     assert.deepEqual([...bad.log.sshRuns, ...noAnchor.log.sshRuns], [])
   })
@@ -482,5 +495,109 @@ describe('service', () => {
   test('sanitizes the container name in terminal titles', () => {
     assert.equal(terminalTitle('logs', 'web\u001b[31m'), 'logs: web[31m')
     assert.equal(terminalTitle('shell', 'x'.repeat(50)), 'shell: ' + 'x'.repeat(40) + '…')
+  })
+})
+
+// The real host list over a fake Orca CLI: GPU2's workspace listing fails (Orca's runtime there is down), cloud-gpu lists none,
+// and GPU3's listing answers without covering the host (connected, but no repo there). Orca's listing must not keep any
+// of them from ssh.
+class ListingCli extends FakeCli {
+  failing = new Set<string>()
+  notCovered = new Set<string>()
+  override async listWorktrees(environment: string, options?: CallOptions) {
+    const rows = await super.listWorktrees(environment, options)
+    if (this.failing.has(environment)) throw new CliError('remote_runtime_unavailable', 'down')
+    if (this.notCovered.has(environment)) throw new CliError('host_not_covered', `Orca could not cover host ${environment}`)
+    return rows
+  }
+}
+
+// `sshProblem`: every ssh run fails with it.
+function listingSetup(opts: { sshProblem?: Problem } = {}) {
+  const cli = new ListingCli()
+  cli.environments = ['GPU2', 'cloud-gpu', 'GPU3']
+  cli.worktrees = { GPU2: [{ path: '/home/me/a5', displayName: 'a5', branch: 'main' }], 'cloud-gpu': [] }
+  cli.failing.add('GPU2')
+  cli.notCovered.add('GPU3')
+  const data = new Map<string, unknown>([[kernelKey('GPU2'), 'Linux'], [kernelKey('cloud-gpu'), 'Linux'], [kernelKey('GPU3'), 'Linux']])
+  const storage: KeyValueStore = {
+    async get(key) { return data.get(key) },
+    async set(key, value) { data.set(key, value) },
+    async delete(key) { data.delete(key) },
+  }
+  const hosts = createHosts({ cli, listLocalWorkspaces: async () => [], platform: 'darwin', storage, now: () => 1_000, log: () => {} })
+  const runs: { env: string; names: string[] }[] = []
+  const answers: Record<string, CommandResult[]> = {
+    snapshot: okResults(), action: [{ name: 'action', code: 0, lines: [ID] }], logs: [{ name: 'logs', code: 0, lines: ['ssh log'] }],
+  }
+  const ssh: SshRunner = {
+    async run(env, commands) {
+      const names = commands.map((c) => c.name)
+      runs.push({ env, names })
+      if (opts.sshProblem) return { ok: false, problem: opts.sshProblem }
+      return { ok: true, value: answers[names.includes('action') ? 'action' : names.includes('logs') ? 'logs' : 'snapshot']! }
+    },
+  }
+  const local: LocalRunner = { async run() { throw new Error('local.run must not be called') } }
+  const service = createService({
+    hosts, local, ssh, cli, storage, now: () => 4242, log: () => {},
+    async openLocalTerminal() { throw new Error('openLocalTerminal must not be called') },
+  })
+  const created = () => cli.calls.filter((c) => c.method === 'createTerminal')
+  return { service, runs, created, data }
+}
+
+describe('service on SSH hosts with Orca listing trouble', () => {
+  test('snapshot, action and logs reach the ssh runner on a host whose listing failed and on one with no workspace', async () => {
+    const t = listingSetup()
+    for (const hostId of ['ssh:GPU2', 'ssh:cloud-gpu'] as const) {
+      const snapshot = await t.service.snapshot(hostId, OPTIONS)
+      assert.equal(snapshot.ok && snapshot.value.serverVersion, '27.0.1', `${hostId} ${JSON.stringify(snapshot)}`)
+      assert.deepEqual(await t.service.action(hostId, 'restart', ID, OPTIONS), { ok: true, value: { done: true } }, hostId)
+      assert.deepEqual(await t.service.logs(hostId, ID, OPTIONS), { ok: true, value: { lines: ['ssh log'], takenAt: 4242 } }, hostId)
+    }
+    const all = ['version', 'ps', 'images', 'volumes', 'networks']
+    assert.deepEqual(t.runs, [
+      { env: 'GPU2', names: all }, { env: 'GPU2', names: ['action'] }, { env: 'GPU2', names: ['logs'] },
+      { env: 'cloud-gpu', names: all }, { env: 'cloud-gpu', names: ['action'] }, { env: 'cloud-gpu', names: ['logs'] },
+    ])
+    assert.deepEqual(t.created(), [])
+  })
+
+  test('on such a host the ssh runner\'s problem comes back as it is', async () => {
+    const problem: Problem = { kind: 'ssh-failed', message: 'ssh to "GPU2" failed: ssh: connect to host gpu2 port 22: Operation timed out.' }
+    const t = listingSetup({ sshProblem: problem })
+    assert.deepEqual(await t.service.snapshot('ssh:GPU2', OPTIONS), { ok: false, problem })
+    assert.deepEqual(await t.service.action('ssh:GPU2', 'stop', ID, OPTIONS), { ok: false, problem })
+    assert.deepEqual(await t.service.logs('ssh:GPU2', ID, OPTIONS), { ok: false, problem })
+    assert.equal(t.runs.length, 3)
+  })
+
+  test('openTerminal answers unreachable when the listing failed and no-workspace when it was empty, with no terminal', async () => {
+    const t = listingSetup()
+    assert.deepEqual(await t.service.openTerminal('ssh:GPU2', 'shell', ID, 'web', FOCUS, OPTIONS),
+      { ok: false, problem: { kind: 'unreachable', message: 'Orca could not reach this host.' } })
+    assert.deepEqual(await t.service.openTerminal('ssh:cloud-gpu', 'logs', ID, 'web', null, OPTIONS),
+      { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
+    // A listing that does not cover the host is no workspace there, not an unreachable host.
+    assert.deepEqual(await t.service.openTerminal('ssh:GPU3', 'shell', ID, 'web', FOCUS, OPTIONS),
+      { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
+    assert.deepEqual(t.created(), [])
+    assert.deepEqual(t.runs, [])
+  })
+
+  test('a known non-Linux kernel answers unsupported for everything, with no ssh run and no terminal', async () => {
+    const t = listingSetup()
+    t.data.set(kernelKey('GPU2'), 'Darwin')
+    t.data.set(kernelKey('cloud-gpu'), 'Darwin')
+    const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
+    for (const hostId of ['ssh:GPU2', 'ssh:cloud-gpu'] as const) {
+      assert.deepEqual(await t.service.snapshot(hostId, OPTIONS), unsupported, hostId)
+      assert.deepEqual(await t.service.action(hostId, 'start', ID, OPTIONS), unsupported, hostId)
+      assert.deepEqual(await t.service.logs(hostId, ID, OPTIONS), unsupported, hostId)
+      assert.deepEqual(await t.service.openTerminal(hostId, 'shell', ID, 'web', FOCUS, OPTIONS), unsupported, hostId)
+    }
+    assert.deepEqual(t.runs, [])
+    assert.deepEqual(t.created(), [])
   })
 })

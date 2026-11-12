@@ -62,10 +62,10 @@
     problems: {
       title: 'Clear answers when something is off',
       points: [
-        'Host unreachable, Docker not running, ssh login problems',
+        'SSH connection failed, Docker not running, Docker CLI not found',
         'Each message says what to check next',
       ],
-      labels: ['SSH host unreachable', 'Docker daemon stopped'],
+      labels: ['SSH connection failed', 'Docker daemon stopped'],
     },
   }
   const q = new URLSearchParams(location.search)

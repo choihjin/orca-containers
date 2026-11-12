@@ -45,6 +45,8 @@ delete a container.
   `ssh -o BatchMode=yes <host name> true` in a terminal on this Mac: it must finish without an error.
   The host name must be made of ASCII letters, digits, `.`, `_` and `-`, and start with a letter or digit; other
   names cannot be used with ssh.
+- Listing, actions and the logs in the panel need only that ssh login. Shell and **Open in terminal** on an SSH
+  host also need a workspace on that host in Orca, and Orca's own connection to that host.
 
 ## Install
 
@@ -52,10 +54,10 @@ In Orca, open **Settings → Plugins**, choose **Add plugin → From a Git URL�
 URL with a version tag and install:
 
 ```text
-https://github.com/choihjin/orca-containers#v0.1.1
+https://github.com/choihjin/orca-containers#v0.1.2
 ```
 
-Or from a terminal: `orca plugin install choihjin/orca-containers@v0.1.1`.
+Or from a terminal: `orca plugin install choihjin/orca-containers@v0.1.2`.
 
 Orca shows what the plugin asks for before it runs anything. Review it, then enable it.
 
@@ -68,11 +70,14 @@ Orca shows what the plugin asks for before it runs anything. Review it, then ena
   repeats on each refresh.
 - **SSH hosts:** listing, actions and the logs in the panel run `ssh <host name>` from this Mac, with the
   Orca host name as the ssh destination, and send a fixed script to `sh` on that host. They open no
-  terminal. ssh runs with `BatchMode=yes`, so it never asks for a password or passphrase: a host it cannot
+  terminal and need only ssh: whether Orca can reach the host or has a workspace there does not matter.
+  ssh runs with `BatchMode=yes`, so it never asks for a password or passphrase: a host it cannot
   log in to without a prompt shows "SSH connection failed" with what to fix. An ssh run that has not
   finished after 60 seconds is stopped.
 - **Terminals on SSH hosts:** only Shell and **Open in terminal** open a terminal. They use Orca's own
-  command-line tool (`orca … --environment <host>`) to open an Orca terminal in a workspace on that host.
+  command-line tool (`orca … --environment <host>`) to open an Orca terminal in a workspace on that host, so
+  they need a workspace on that host in Orca and Orca's own connection to it. Without them the panel says
+  "Host unreachable" (Orca cannot reach the host) or "No workspace on this host".
 
 ## What it asks for
 

@@ -19,33 +19,43 @@ test('allowed actions follow the container state', () => {
   for (const s of ['removing', 'unknown'] as const) assert.deepEqual(allowedActions(s), { start: false, stop: false, restart: false, logs: true, shell: false, remove: false })
 })
 
-test('host options label status and disable unusable hosts', () => {
+// Only an unsupported host gets a status in its label; every ready host can be picked (no "unreachable" or
+// "no workspace" labels: Orca's workspace listing no longer decides).
+test('host options mark and disable only unsupported hosts', () => {
   const options = hostOptions([
-    host('local', 'Mac', 'ready'), host('ssh:GPU1', 'GPU1', 'ready'), host('ssh:cloud-gpu', 'cloud-gpu', 'no-workspace'),
-    host('ssh:GPU2', 'GPU2', 'unreachable'), host('ssh:old', 'old', 'unsupported'),
+    host('local', 'Mac', 'ready'), host('ssh:GPU1', 'GPU1', 'ready'), host('ssh:cloud-gpu', 'cloud-gpu', 'ready'),
+    host('ssh:old', 'old', 'unsupported'),
   ])
   assert.deepEqual(options, [
     { value: 'local', label: 'This Mac' },
     { value: 'ssh:GPU1', label: 'GPU1 (SSH)' },
-    { value: 'ssh:cloud-gpu', label: 'cloud-gpu (SSH, no workspace)', disabled: true },
-    { value: 'ssh:GPU2', label: 'GPU2 (SSH, unreachable)', disabled: true },
+    { value: 'ssh:cloud-gpu', label: 'cloud-gpu (SSH)' },
     { value: 'ssh:old', label: 'old (SSH, unsupported)', disabled: true },
   ])
   assert.deepEqual(hostOptions([host('local', 'Mac', 'unsupported')]), [{ value: 'local', label: 'This Mac (unsupported)', disabled: true }])
-  assert.equal('disabled' in options[0]!, false)
+  assert.ok(options.slice(0, 3).every((o) => !('disabled' in o)), JSON.stringify(options))
 })
 
 test('follows focus only when enabled and the match is usable', () => {
-  const hosts = [host('local', 'Mac', 'ready'), host('ssh:A', 'A', 'ready'), host('ssh:B', 'B', 'unreachable')]
+  const hosts = [host('local', 'Mac', 'ready'), host('ssh:A', 'A', 'ready'), host('ssh:B', 'B', 'unsupported')]
   assert.equal(nextHost('local', 'ssh:A', true, hosts), 'ssh:A')
   assert.equal(nextHost('local', 'ssh:A', false, hosts), 'local')
   assert.equal(nextHost('local', 'ssh:B', true, hosts), 'local')
   assert.equal(nextHost('local', 'ssh:gone', true, hosts), 'local')
   assert.equal(nextHost(null, null, true, hosts), 'local')
   assert.equal(nextHost('ssh:gone', null, true, [host('local', 'Mac', 'unsupported'), host('ssh:A', 'A', 'ready')]), 'ssh:A')
-  assert.equal(nextHost('ssh:B', null, true, [host('ssh:B', 'B', 'unreachable')]), 'ssh:B')
-  assert.equal(nextHost(null, null, true, [host('ssh:B', 'B', 'unreachable')]), null)
+  assert.equal(nextHost('ssh:B', null, true, [host('ssh:B', 'B', 'unsupported')]), 'ssh:B')
+  assert.equal(nextHost(null, null, true, [host('ssh:B', 'B', 'unsupported')]), null)
   assert.equal(nextHost(null, null, true, []), null)
+})
+
+// Auto-pick takes the first ready host: an unsupported This Mac is skipped for the first SSH host.
+test('auto-picks the first ready host and skips unsupported ones', () => {
+  const hosts = [host('local', 'Mac', 'unsupported'), host('ssh:old', 'old', 'unsupported'), host('ssh:A', 'A', 'ready'), host('ssh:B', 'B', 'ready')]
+  assert.equal(nextHost(null, null, true, hosts), 'ssh:A')
+  assert.equal(nextHost(null, 'ssh:B', true, hosts), 'ssh:B')
+  assert.equal(nextHost(null, 'ssh:old', true, hosts), 'ssh:A')
+  assert.equal(nextHost(null, 'ssh:B', false, hosts), 'ssh:A')
 })
 
 test('refresh intervals come from settings with defaults', () => {

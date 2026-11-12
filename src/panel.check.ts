@@ -14,7 +14,7 @@ function scenario(r: Stubs, options: Omit<CheckScenario, 'requests'> = {}): Chec
 
 const LOCAL: HostInfo = { id: 'local', label: 'This Mac', kind: 'local', status: 'ready' }
 const GPU1: HostInfo = { id: 'ssh:GPU1', label: 'GPU1', kind: 'ssh', status: 'ready' }
-const GPU2: HostInfo = { id: 'ssh:GPU2', label: 'GPU2', kind: 'ssh', status: 'unreachable' }
+const GPU2: HostInfo = { id: 'ssh:GPU2', label: 'GPU2', kind: 'ssh', status: 'ready' }
 
 const row = (
   id: string, name: string, image: string, state: ContainerRow['state'], status: string, ports = '', compose = { project: '', service: '' },
@@ -73,7 +73,9 @@ export default defineCheck({
   ssh: scenario(stubs([LOCAL, GPU1], listed), { persisted: { plugin: { selectedHost: 'ssh:GPU1' } } }),
   daemonDown: scenario(stubs([LOCAL, GPU1], () =>
     failure({ kind: 'daemon-down', message: 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock.' }))),
-  unreachable: scenario(stubs([LOCAL, GPU2], () => failure({ kind: 'unreachable', message: 'ssh: connect to host timed out' })), {
+  // A ready SSH host that ssh cannot reach.
+  sshFailed: scenario(stubs([LOCAL, GPU2], () =>
+    failure({ kind: 'ssh-failed', message: 'ssh to "GPU2" failed: ssh: connect to host gpu2 port 22: Operation timed out.' })), {
     persisted: { plugin: { selectedHost: 'ssh:GPU2' } },
   }),
   empty: scenario(stubs([LOCAL], ({ hostId }) => snapshot(hostId, []))),

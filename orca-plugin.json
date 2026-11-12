@@ -4,7 +4,7 @@
   "execution": "trusted-worker",
   "id": "containers",
   "name": "Containers",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lists and manages containers on this Mac and on Linux SSH hosts from a sidebar panel, with logs in the panel and a shell in an Orca terminal.",
   "icon": "assets/icon.png",
   "cover": { "path": "assets/cover.png", "alt": "The Containers icon and name beside two Containers panels, one light and one dark" },
@@ -13,8 +13,8 @@
     { "path": "assets/screenshots/ssh-dark.png", "alt": "Containers panel on an SSH host named GPU1, with a Compose project grouped by service", "caption": "Containers on an SSH host, grouped by Compose project", "theme": "dark" },
     { "path": "assets/screenshots/resources-light.png", "alt": "Containers panel on this Mac with the containers, images, volumes and networks sections open", "caption": "Containers, images, volumes and networks at a glance", "theme": "light" },
     { "path": "assets/screenshots/resources-dark.png", "alt": "Containers panel on this Mac with the containers, images, volumes and networks sections open", "caption": "Containers, images, volumes and networks at a glance", "theme": "dark" },
-    { "path": "assets/screenshots/problems-light.png", "alt": "Two panels: an SSH host that cannot be reached, and a host whose Docker daemon is stopped", "caption": "Clear messages when a host or Docker is down", "theme": "light" },
-    { "path": "assets/screenshots/problems-dark.png", "alt": "Two panels: an SSH host that cannot be reached, and a host whose Docker daemon is stopped", "caption": "Clear messages when a host or Docker is down", "theme": "dark" }
+    { "path": "assets/screenshots/problems-light.png", "alt": "Two panels: an SSH host whose ssh connection failed, and a host whose Docker daemon is stopped", "caption": "Clear messages when ssh or Docker fails", "theme": "light" },
+    { "path": "assets/screenshots/problems-dark.png", "alt": "Two panels: an SSH host whose ssh connection failed, and a host whose Docker daemon is stopped", "caption": "Clear messages when ssh or Docker fails", "theme": "dark" }
   ],
   "author": {
     "name": "choihjin",

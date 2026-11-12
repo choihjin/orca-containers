@@ -16,12 +16,13 @@ export function allowedActions(state: ContainerState): Allowed {
   }
 }
 
+// Only an unsupported host is marked, and it cannot be picked.
 export function hostOptions(hosts: readonly HostInfo[]): { value: string; label: string; disabled?: boolean }[] {
   return hosts.map((h) => {
     const ready = h.status === 'ready'
     const base = h.kind === 'local' ? 'This Mac' : h.label
     const parts = h.kind === 'local' ? [] : ['SSH']
-    if (!ready) parts.push(h.status === 'no-workspace' ? 'no workspace' : h.status)
+    if (!ready) parts.push('unsupported')
     const label = parts.length > 0 ? `${base} (${parts.join(', ')})` : base
     return ready ? { value: h.id, label } : { value: h.id, label, disabled: true }
   })

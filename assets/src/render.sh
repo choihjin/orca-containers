@@ -26,7 +26,7 @@ case "${1:-}" in
     mkdir -p "$SRC/shots"
     shoot ssh ssh 760
     shoot resources resources 760
-    shoot unreachable unreachable 520
+    shoot sshFailed sshFailed 520
     shoot daemonDown daemonDown 520
     ;;
   images)
@@ -36,7 +36,7 @@ case "${1:-}" in
     for theme in light dark; do
       render "frame.html?slide=ssh&shot=ssh&theme=$theme" "assets/screenshots/ssh-$theme.png" 1600 1000
       render "frame.html?slide=resources&shot=resources&theme=$theme" "assets/screenshots/resources-$theme.png" 1600 1000
-      render "frame.html?slide=problems&shot=unreachable,daemonDown&theme=$theme" "assets/screenshots/problems-$theme.png" 1600 1000
+      render "frame.html?slide=problems&shot=sshFailed,daemonDown&theme=$theme" "assets/screenshots/problems-$theme.png" 1600 1000
     done
     ;;
   *) echo "usage: $0 shots|images" >&2; exit 2 ;;
