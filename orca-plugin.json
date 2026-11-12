@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "containers",
+  "name": "Containers",
+  "version": "0.1.0",
+  "description": "Lists and manages containers on this Mac and on Linux SSH hosts from a sidebar panel, with logs in the panel and a shell in an Orca terminal.",
+  "author": {
+    "name": "choihjin",
+    "url": "https://github.com/choihjin"
+  },
+  "license": "MIT",
+  "engines": {
+    "orca": ">=1.4.255"
+  },
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "containers",
+        "title": "Containers",
+        "icon": "package",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "settings": [
+      { "key": "refreshLocalSeconds", "title": "Local refresh (seconds)", "type": "integer", "default": 10, "minimum": 3, "maximum": 600 },
+      { "key": "refreshRemoteSeconds", "title": "SSH refresh (seconds)", "type": "integer", "default": 60, "minimum": 15, "maximum": 3600 }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "terminal:send" },
+    { "kind": "storage:own" },
+    { "kind": "settings:own" }
+  ]
+}

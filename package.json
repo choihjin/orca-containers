@@ -1,0 +1,16 @@
+{
+  "name": "orca-containers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "orca plugin test .",
+    "typecheck": "orca plugin types . && tsc --noEmit",
+    "validate": "orca plugin validate ."
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
