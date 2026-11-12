@@ -1,5 +1,5 @@
 import { assert, describe, test } from 'orca/testing'
-import type { ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Problem, Result } from './protocol'
+import type { ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Problem, ResourceKind, Result } from './protocol'
 import { createHosts, type Anchor, type Hosts, type NoAnchor } from './hosts'
 import type { LocalRunner } from './local/runner'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
@@ -112,12 +112,14 @@ function noTerminalSetup() {
   const runs: { env: string; names: string[] }[] = []
   const answers: Record<string, CommandResult[]> = {
     snapshot: okResults(), action: [{ name: 'action', code: 0, lines: [ID] }], logs: [{ name: 'logs', code: 0, lines: ['ssh log'] }],
+    remove: [{ name: 'remove', code: 0, lines: ['pgdata'] }],
   }
   const ssh: SshRunner = {
     async run(env, commands) {
       const names = commands.map((c) => c.name)
       runs.push({ env, names })
-      return { ok: true, value: answers[names.includes('action') ? 'action' : names.includes('logs') ? 'logs' : 'snapshot']! }
+      const single = ['action', 'logs', 'remove'].find((name) => names.includes(name as DockerCommand['name']))
+      return { ok: true, value: answers[single ?? 'snapshot']! }
     },
   }
   const local: LocalRunner = { async run() { used.push('local.run'); return [] } }
@@ -495,6 +497,202 @@ describe('service', () => {
   test('sanitizes the container name in terminal titles', () => {
     assert.equal(terminalTitle('logs', 'web\u001b[31m'), 'logs: web[31m')
     assert.equal(terminalTitle('shell', 'x'.repeat(50)), 'shell: ' + 'x'.repeat(40) + '…')
+  })
+})
+
+const DIGEST = `sha256:${'0123456789abcdef'.repeat(4)}`
+const NET = 'b'.repeat(64)
+const DAEMON = 'Error response from daemon: '
+// A few of the values the command tests refuse: options, spaces, shell syntax, a newline, "..", a second "@".
+const BAD_REFS = ['-f', '--force', 'a b', 'a;b', '$(id)', 'a\nb', '../x', `a@b@${DIGEST}`, '']
+
+describe('service: remove an image, volume or network', () => {
+  test('a local remove runs the fixed command and succeeds on code 0, with no anchor lookup', async () => {
+    const t = setup({ anchor: { missing: 'no-workspace' } })
+    t.setLocal([{ name: 'remove', code: 0, lines: ['Untagged: nginx:1.27'] }])
+    assert.deepEqual(await t.service.removeResource('local', 'image', 'nginx:1.27', OPTIONS), { ok: true, value: { done: true } })
+    assert.deepEqual(t.log.localRuns, [{ commands: [{ name: 'remove', argv: ['image', 'rm', 'nginx:1.27'] }], options: OPTIONS }])
+    assert.deepEqual(t.log.anchors, [])
+    assert.deepEqual(t.log.sshRuns, [])
+  })
+
+  test('an SSH remove goes to the ssh runner for each kind, with no anchor, no terminal and nothing remembered', async () => {
+    const cases = [
+      { kind: 'image' as const, ref: DIGEST, argv: ['image', 'rm', DIGEST] },
+      { kind: 'volume' as const, ref: 'pgdata', argv: ['volume', 'rm', 'pgdata'] },
+      { kind: 'network' as const, ref: NET, argv: ['network', 'rm', NET] },
+    ]
+    for (const { kind, ref, argv } of cases) {
+      const t = setup({ anchor: { path: '/home/me/main' } })
+      t.setSsh({ ok: true, value: [{ name: 'remove', code: 0, lines: [ref] }] })
+      assert.deepEqual(await t.service.removeResource('ssh:A', kind, ref, OPTIONS), { ok: true, value: { done: true } }, kind)
+      assert.deepEqual(t.log.sshRuns, [{ env: 'A', commands: [{ name: 'remove', argv }], options: OPTIONS }], kind)
+      assert.deepEqual(t.log.order, ['ssh.run'], kind)
+      assert.deepEqual(t.log.remembered, [])
+    }
+    const bare = noTerminalSetup()
+    assert.deepEqual(await bare.service.removeResource('ssh:A', 'volume', 'pgdata', OPTIONS), { ok: true, value: { done: true } })
+    assert.deepEqual(bare.runs, [{ env: 'A', names: ['remove'] }])
+    assert.deepEqual(bare.used, [])
+  })
+
+  test('a remove the daemon refuses is classified: its message for an item in use, the usual kinds otherwise', async () => {
+    const inUse = 'conflict: unable to remove repository reference "nginx:1.27" (must force) - container 0123456789ab is using its referenced image 5f1e6a2b'
+    const t = setup()
+    t.setLocal([{ name: 'remove', code: 1, lines: [`${DAEMON}${inUse}`] }])
+    assert.deepEqual(await t.service.removeResource('local', 'image', 'nginx:1.27', OPTIONS), { ok: false, problem: { kind: 'failed', message: inUse } })
+    const volume = 'remove pgdata: volume is in use - [0123456789ab]'
+    const t2 = setup()
+    t2.setSsh({ ok: true, value: [{ name: 'remove', code: 1, lines: [`${DAEMON}${volume}`] }] })
+    assert.deepEqual(await t2.service.removeResource('ssh:A', 'volume', 'pgdata', OPTIONS), { ok: false, problem: { kind: 'failed', message: volume } })
+    const t3 = setup()
+    t3.setLocal([{ name: 'remove', code: 1, lines: ['permission denied while trying to connect to the Docker daemon socket'] }])
+    const denied = await t3.service.removeResource('local', 'network', NET, OPTIONS)
+    assert.equal(!denied.ok && denied.problem.kind, 'permission-denied')
+    const t4 = setup()
+    t4.setLocal([{ name: 'remove', code: 124, lines: [] }])
+    const slow = await t4.service.removeResource('local', 'volume', 'pgdata', OPTIONS)
+    assert.equal(!slow.ok && slow.problem.kind, 'timeout')
+    // No result for the command at all is a failure, not a success.
+    const t5 = setup()
+    t5.setLocal([])
+    const none = await t5.service.removeResource('local', 'volume', 'pgdata', OPTIONS)
+    assert.deepEqual(none, { ok: false, problem: { kind: 'failed', message: 'remove produced no result' } })
+  })
+
+  test('a network with endpoints, a predefined network and an image in several repositories are failed with the daemon\'s line', async () => {
+    const cases = [
+      { kind: 'network' as const, ref: NET, line: `error while removing network: network ml_default id ${NET} has active endpoints` },
+      { kind: 'network' as const, ref: NET, line: 'bridge is a pre-defined network and cannot be removed' },
+      { kind: 'image' as const, ref: '5f1e6a2b0c3d', line: 'conflict: unable to delete 5f1e6a2b0c3d (must be forced) - image is referenced in multiple repositories' },
+    ]
+    for (const { kind, ref, line } of cases) {
+      for (const hostId of ['local', 'ssh:A'] as const) {
+        const t = setup()
+        const answer = [{ name: 'remove', code: 1, lines: [`${DAEMON}${line}`] }]
+        t.setLocal(answer)
+        t.setSsh({ ok: true, value: answer })
+        assert.deepEqual(await t.service.removeResource(hostId, kind, ref, OPTIONS), { ok: false, problem: { kind: 'failed', message: line } }, `${hostId} ${line}`)
+      }
+    }
+  })
+
+  test('ssh problems pass through a remove', async () => {
+    const t = setup()
+    const problem = { kind: 'ssh-failed' as const, message: 'No ssh host named "A" on this Mac.' }
+    t.setSsh({ ok: false, problem })
+    assert.deepEqual(await t.service.removeResource('ssh:A', 'image', 'nginx', OPTIONS), { ok: false, problem })
+  })
+
+  test('an invalid ref or kind is refused before any runner, on either host', async () => {
+    const t = setup()
+    for (const hostId of ['local', 'ssh:A'] as const) {
+      for (const kind of ['image', 'volume', 'network'] as const) {
+        for (const ref of BAD_REFS) {
+          const r = await t.service.removeResource(hostId, kind, ref, OPTIONS)
+          assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} ${kind} ${JSON.stringify(ref)}`)
+        }
+      }
+      const kind = await t.service.removeResource(hostId, 'container' as ResourceKind, ID, OPTIONS)
+      assert.equal(!kind.ok && kind.problem.kind, 'invalid')
+      // A network name is not its id.
+      const name = await t.service.removeResource(hostId, 'network', 'bridge', OPTIONS)
+      assert.equal(!name.ok && name.problem.kind, 'invalid')
+    }
+    assert.deepEqual(t.calls, [])
+  })
+
+  test('a remove on a host that is not ready, or not known, runs nothing', async () => {
+    const t = setup({ status: 'unsupported' })
+    assert.deepEqual(await t.service.removeResource('ssh:A', 'image', 'nginx', OPTIONS),
+      { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } })
+    assert.deepEqual(await t.service.removeResource('local', 'volume', 'pgdata', OPTIONS),
+      { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } })
+    const unknown = await setup().service.removeResource('ssh:nope', 'image', 'nginx', OPTIONS)
+    assert.equal(!unknown.ok && unknown.problem.kind, 'invalid')
+    assert.deepEqual(t.calls, [])
+  })
+})
+
+describe('service: pull an image in a terminal', () => {
+  test('a local pull opens a plugin terminal with docker pull and the title, and switches to it', async () => {
+    const t = setup()
+    const r = await t.service.pullTerminal('local', 'nginx:latest', FOCUS, OPTIONS)
+    assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
+    assert.deepEqual(t.log.localTerminals, [{ workspaceId: 'ws1', title: 'pull: nginx:latest', command: 'docker pull nginx:latest' }])
+    assert.deepEqual(t.log.anchors, [{ hostId: 'local', focus: FOCUS }])
+    assert.deepEqual(t.log.switched, [{ handle: 'local_term' }])
+    assert.deepEqual(t.log.localRuns, [])
+    assert.equal(t.calls.includes('createTerminal'), false)
+  })
+
+  test('an SSH pull opens a focused Orca terminal on the anchor, remembers it and switches to it, with no docker run', async () => {
+    const t = setup({ anchor: { path: '/home/me/main' } })
+    const r = await t.service.pullTerminal('ssh:A', 'ghcr.io/org/app:1.2', null, OPTIONS)
+    assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'main' } })
+    assert.deepEqual(t.log.created, [{
+      environment: 'A', worktreePath: '/home/me/main', title: 'pull: ghcr.io/org/app:1.2', command: 'docker pull ghcr.io/org/app:1.2', focus: true,
+    }])
+    assert.deepEqual(t.log.remembered, [{ hostId: 'ssh:A', path: '/home/me/main' }])
+    assert.deepEqual(t.log.switched, [{ environment: 'A', handle: 'term_1' }])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.sshRuns, [])
+  })
+
+  test('a pull by digest keeps the whole reference in the command', async () => {
+    const t = setup()
+    await t.service.pullTerminal('local', `name@${DIGEST}`, FOCUS, OPTIONS)
+    assert.equal(t.log.localTerminals[0]!.command, `docker pull name@${DIGEST}`)
+  })
+
+  test('a pull follows the Shell rules: Linux check, anchor, host status', async () => {
+    const unknownKernel = setup({ kernel: null, anchor: { path: '/home/me/main' } })
+    assert.equal((await unknownKernel.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS)).ok, true)
+    assert.deepEqual(unknownKernel.log.sshRuns, [{ env: 'A', commands: [], options: OPTIONS }])
+    assert.deepEqual(unknownKernel.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', 'createTerminal', 'remember', 'switchTo'])
+    const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
+    const darwin = setup({ kernel: 'Darwin' })
+    assert.deepEqual(await darwin.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), unsupported)
+    const down = setup({ status: 'unsupported' })
+    assert.deepEqual(await down.service.pullTerminal('local', 'nginx', FOCUS, OPTIONS), unsupported)
+    assert.deepEqual(await down.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), unsupported)
+    for (const missing of ['unreachable', 'no-workspace'] as const) {
+      const t = setup({ anchor: { missing } })
+      assert.deepEqual(await t.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS),
+        { ok: false, problem: { kind: missing, message: missing === 'unreachable' ? 'Orca could not reach this host.' : 'This host has no workspace.' } })
+      assert.deepEqual(await t.service.pullTerminal('local', 'nginx', FOCUS, OPTIONS),
+        { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
+      assert.deepEqual(t.calls, [])
+    }
+    for (const t of [darwin, down]) {
+      assert.deepEqual([...t.log.created, ...t.log.localTerminals, ...t.log.sshRuns], [])
+    }
+    const cliDown = setup()
+    cliDown.failCreate(new CliError('cli_exec_failed', 'cannot reach'))
+    assert.deepEqual(await cliDown.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), { ok: false, problem: { kind: 'unreachable', message: 'cannot reach' } })
+    assert.deepEqual(cliDown.log.switched, [])
+  })
+
+  test('an invalid ref opens no terminal and runs nothing, on either host', async () => {
+    for (const ref of [...BAD_REFS, 'nginx..latest', 'nginx@latest', `name@${DIGEST.slice(0, 20)}`]) {
+      const t = setup({ kernel: null })
+      for (const hostId of ['local', 'ssh:A'] as const) {
+        const r = await t.service.pullTerminal(hostId, ref, FOCUS, OPTIONS)
+        assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} ${JSON.stringify(ref)}`)
+      }
+      assert.deepEqual(t.calls, [], JSON.stringify(ref))
+      assert.deepEqual(t.log.remembered, [])
+    }
+  })
+
+  test('the pull title is the reference, cut to 40 characters', async () => {
+    assert.equal(terminalTitle('pull', 'nginx:latest'), 'pull: nginx:latest')
+    const long = `registry.example.com/${'a'.repeat(40)}:1`
+    assert.equal(terminalTitle('pull', long), `pull: ${long.slice(0, 40)}…`)
+    const t = setup()
+    await t.service.pullTerminal('local', long, FOCUS, OPTIONS)
+    assert.equal(t.log.localTerminals[0]!.title, `pull: ${long.slice(0, 40)}…`)
+    assert.equal(t.log.localTerminals[0]!.command, `docker pull ${long}`)
   })
 })
 

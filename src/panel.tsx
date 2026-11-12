@@ -2,21 +2,25 @@ import {
   Button, Callout, Card, CodeView, Collapsible, EmptyState, IconButton, Input, KeyValue, RelativeTime, Row, Select, Skeleton, Spinner, Stack,
   Switch, Text, Toolbar, Tree, atom, on, plugin, read, set, settings, update, type OrcaNode, type PanelContext, type Tone, type TreeItem,
 } from 'orca'
+import { isImageRef } from './docker/commands'
 import {
   allowedActions, containerDetails, containerTree, dueForRefresh, hostOptions, imageTree, logRefreshMs, logText, networkTree, nextHost,
-  problemCopy, refreshMs, rejectionProblem, runningCount, volumeTree, type Allowed,
+  problemCopy, refreshMs, rejectionProblem, resourceDetails, resourceKindOf, runningCount, shownKey, volumeTree, type Allowed,
+  type ResourceDetails,
 } from './panel-model'
 import {
-  REQUEST_TIMEOUT_MS, type ContainerAction, type ContainerRow, type FocusContext, type HostId, type HostInfo, type Problem, type Result,
-  type Snapshot, type TerminalKind,
+  REQUEST_TIMEOUT_MS, type ContainerAction, type ContainerRow, type FocusContext, type HostId, type HostInfo, type Problem, type ResourceKind,
+  type Result, type Snapshot, type TerminalKind,
 } from './protocol'
 
 // What the panel shows for the selected host: the last snapshot it applied, the problem of the
 // latest answer, and whether the latest request is still out (the in-flight flag).
 type HostView = { hostId: HostId; snapshot: Snapshot | null; problem: Problem | null; loading: boolean }
-// The container an action, its result or a delete question belongs to; the card draws only its own.
+// The item an action, its result or a delete question belongs to: a container id, an image, volume or network
+// tree key, or PULL_ROW. The card (or the pull row) draws only its own.
 type Target = { hostId: HostId; id: string }
-type PendingDelete = Target & { name: string }
+// `ref` is what the delete sends: the container id, or the image reference or id, volume name or network id.
+type PendingDelete = Target & { name: string; kind: 'container' | ResourceKind; ref: string }
 // The log view under the card: its container, the cleaned text of the last answer it applied (null: none
 // yet), the problem of the latest answer, and whether its logs are still on the way.
 type LogView = Target & { text: string | null; takenAt: number | null; problem: Problem | null; loading: boolean }
@@ -27,12 +31,13 @@ const hostList = atom<HostInfo[] | null>(null)
 const hostsProblem = atom<Problem | null>(null)
 const hostsLoading = atom(false)
 const hostView = atom<HostView | null>(null)
+// A tree key: a container id, or an image tag, volume or network row. Group rows are never selected.
 const selection = atom<string | null>(null)
 const pendingDelete = atom<PendingDelete | null>(null)
 const working = atom(false)
 // Both clear on the next action or a host change.
 const actionProblem = atom<(Target & { problem: Problem }) | null>(null)
-// "Opened logs in <workspace>." after a Logs/Shell tab opened in the background.
+// "Opened logs in <workspace>." after a Logs, Shell or Pull tab opened in the background.
 const openedNote = atom<(Target & { text: string }) | null>(null)
 // Open for the selected container only: it follows the selection and closes when the selection clears.
 const logView = atom<LogView | null>(null)
@@ -42,6 +47,14 @@ const SECTIONS_OPEN: Record<Section, boolean> = { containers: true, images: fals
 const sectionsOpen = atom<Record<Section, boolean>>('sections', SECTIONS_OPEN, { persist: 'plugin' })
 // Compose projects the person collapsed; every other project the tree draws is expanded, new ones included.
 const collapsedProjects = atom<string[]>([])
+// Image repositories the person expanded; the others stay collapsed.
+const expandedRepos = atom<string[]>([])
+// The Images section's "Image to pull" field, and why its last Pull was refused (null: it was not).
+const pullText = atom('')
+const pullError = atom<string | null>(null)
+// The Target id of the pull row's problem and note; no tree key looks like it.
+const PULL_ROW = 'pull-by-name'
+const PULL_INVALID = 'Not an image name. Use one like nginx:latest or ghcr.io/org/app:1.2.'
 
 // Per panel run, reset by setup: plain values the screen does not draw.
 type Run = {
@@ -91,6 +104,7 @@ function selectHost(hostId: HostId | null): void {
   set(selectedHost, hostId)
   clearSelection()
   set(collapsedProjects, [])
+  set(expandedRepos, [])
   set(actionProblem, null)
   set(openedNote, null)
   run.lastAt = null
@@ -121,11 +135,20 @@ async function refreshSnapshot(): Promise<void> {
   set(hostView, { hostId, snapshot: answer.value, problem: null, loading: false })
   // Gone, or no longer in the tree the filter leaves.
   const selected = read(selection)
-  if (selected !== null && !shownInTree(answer.value.containers, read(filterText), selected)) clearSelection()
+  if (selected !== null && !shownKey(answer.value, read(filterText), selected)) clearSelection()
   const pending = read(pendingDelete)
-  const pinned = pending === null ? undefined : answer.value.containers.find((c) => c.id === pending.id)
-  // Gone, or now in a state where removing is not allowed (e.g. it started running).
-  if (pending !== null && (pinned === undefined || !allowedActions(pinned.state).remove)) set(pendingDelete, null)
+  if (pending !== null && !stillRemovable(answer.value, pending)) set(pendingDelete, null)
+}
+
+// A container must still be there in a state that allows removing it (it may have started running); an image,
+// volume or network must still be there under its key and be deleted by the same reference.
+function stillRemovable(snapshot: Snapshot, pending: PendingDelete): boolean {
+  if (pending.kind === 'container') {
+    const pinned = snapshot.containers.find((c) => c.id === pending.id)
+    return pinned !== undefined && allowedActions(pinned.state).remove
+  }
+  const details = resourceDetails(snapshot, pending.id)
+  return details !== null && details.removeBlocked === null && details.removeRef === pending.ref
 }
 
 // `refresh` (the Refresh button) makes the worker read the hosts again and forget the kernels it remembered.
@@ -194,7 +217,7 @@ async function loadSettings(r: Run): Promise<void> {
   }
 }
 
-// Runs one command for `target`; the whole Toolbar is disabled until it ends. `onOk` sees a success on the same host.
+// Runs one command for `target`; every Toolbar and Pull button is disabled until it ends. `onOk` sees a success on the same host.
 async function runCommand<T>(target: Target, send: () => Promise<Result<T>>, refreshAfter: boolean, onOk?: (value: T) => void): Promise<void> {
   if (read(working)) return
   const r = run
@@ -219,6 +242,38 @@ function openTerminal(hostId: HostId, kind: TerminalKind, containerId: string, c
   const target = { hostId, id: containerId }
   return runCommand(target, () => plugin.request('docker.openTerminal', { hostId, kind, containerId, containerName }, DOCKER_REQUEST), false,
     ({ workspace }) => set(openedNote, { ...target, text: `Opened ${kind} in ${workspace}.` }))
+}
+
+// Opens `docker pull <ref>` in a terminal on the host, as Shell does; the note and a problem go to `target`
+// (an image tag's card, or the pull row).
+function pullImage(hostId: HostId, targetId: string, ref: string): Promise<void> {
+  const target = { hostId, id: targetId }
+  return runCommand(target, () => plugin.request('docker.pullTerminal', { hostId, ref }, DOCKER_REQUEST), false,
+    ({ workspace }) => set(openedNote, { ...target, text: `Opened pull: ${ref} in ${workspace}.` }))
+}
+
+// The same rule the worker applies; a refused name stays in the field with an error under it, and nothing is sent.
+function pullByName(hostId: HostId): void {
+  const ref = read(pullText).trim()
+  if (!isImageRef(ref)) {
+    set(pullError, PULL_INVALID)
+    return
+  }
+  set(pullError, null)
+  void pullImage(hostId, PULL_ROW, ref)
+}
+
+function changePullText(text: string): void {
+  set(pullText, text)
+  set(pullError, null)
+}
+
+// Never forced: Docker refuses an item in use, and its answer shows on the card. A delete that went through
+// clears the selection, unless the person has picked something else meanwhile.
+function removeResource(hostId: HostId, key: string, kind: ResourceKind, ref: string): Promise<void> {
+  return runCommand({ hostId, id: key }, () => plugin.request('docker.removeResource', { hostId, kind, ref }, DOCKER_REQUEST), true, () => {
+    if (read(selection) === key) clearSelection()
+  })
 }
 
 // Shows the log view for this container, fetching at once; for the container it already shows, a fetch now.
@@ -283,17 +338,20 @@ function confirmDelete(): void {
   const pinned = read(pendingDelete)
   if (pinned === null) return
   set(pendingDelete, null)
-  void containerAction(pinned.hostId, 'remove', pinned.id)
+  if (pinned.kind === 'container') void containerAction(pinned.hostId, 'remove', pinned.id)
+  else void removeResource(pinned.hostId, pinned.id, pinned.kind, pinned.ref)
 }
 
 // The selection, a pending delete and the log view change together: a delete question never outlives its
-// container's card, and an open log view switches to the container picked next.
+// card, and an open log view switches to the container picked next, or closes for an image, volume or network.
 function changeSelection(next: string): void {
   if (next === read(selection)) return
   set(selection, next)
   set(pendingDelete, null)
   const logs = read(logView)
-  if (logs !== null) openLogs(logs.hostId, next)
+  if (logs === null) return
+  if (containerOf(next) !== null) openLogs(logs.hostId, next)
+  else closeLogs()
 }
 
 function clearSelection(): void {
@@ -302,37 +360,47 @@ function clearSelection(): void {
   closeLogs()
 }
 
-function shownInTree(rows: readonly ContainerRow[], filter: string, id: string): boolean {
-  return containerTree(rows, filter).some((item) => item.key === id || item.children?.some((child) => child.key === id) === true)
-}
-
 function changeFilter(text: string): void {
   set(filterText, text)
   const selected = read(selection)
-  if (selected !== null && !shownInTree(read(hostView)?.snapshot?.containers ?? [], text, selected)) clearSelection()
+  const snapshot = read(hostView)?.snapshot ?? null
+  if (selected !== null && (snapshot === null || !shownKey(snapshot, text, selected))) clearSelection()
 }
+
+const SECTION_OF: Record<PendingDelete['kind'], Section> = { container: 'containers', image: 'images', volume: 'volumes', network: 'networks' }
 
 function setSectionOpen(section: Section, open: boolean): void {
   update(sectionsOpen, (before) => ({ ...SECTIONS_OPEN, ...before, [section]: open }))
-  // Closing the section hides the card, so a delete question and the log view there are dropped.
-  if (section === 'containers' && !open) {
-    set(pendingDelete, null)
-    closeLogs()
-  }
+  if (open) return
+  // Closing a section hides its card, so a delete question there is dropped, and so is the log view under Containers.
+  const pending = read(pendingDelete)
+  if (pending !== null && SECTION_OF[pending.kind] === section) set(pendingDelete, null)
+  if (section === 'containers') closeLogs()
 }
 
 function toggleProject(key: string, expanded: boolean): void {
   update(collapsedProjects, (before) => expanded ? before.filter((k) => k !== key) : before.includes(key) ? before : [...before, key])
 }
 
-// Tree keys are container ids or `project:<name>`; only a container id picks or opens anything (a group row toggles).
+function toggleRepo(key: string, expanded: boolean): void {
+  update(expandedRepos, (before) => !expanded ? before.filter((k) => k !== key) : before.includes(key) ? before : [...before, key])
+}
+
+// Tree keys are container ids, `image:`, `volume:` and `network:` rows, and the group rows `project:<name>` and
+// `repo:<name>`. Only a container or one of those rows is picked (a group row toggles); only a container opens anything.
 function containerOf(key: string): ContainerRow | null {
   return read(hostView)?.snapshot?.containers.find((c) => c.id === key) ?? null
 }
 
+function resourceOf(key: string): ResourceDetails | null {
+  const snapshot = read(hostView)?.snapshot ?? null
+  return snapshot === null ? null : resourceDetails(snapshot, key)
+}
+
 function pickItem(key: string): void {
-  if (containerOf(key) !== null) changeSelection(key)
+  if (containerOf(key) !== null || resourceOf(key) !== null) changeSelection(key)
   else if (key.startsWith('project:')) toggleProject(key, read(collapsedProjects).includes(key))
+  else if (key.startsWith('repo:')) toggleRepo(key, !read(expandedRepos).includes(key))
 }
 
 // Enter or a double click: the container becomes the selected one and its log view opens under its card,
@@ -393,6 +461,24 @@ function problemCallout(problem: Problem, tone: Tone, key: string): OrcaNode {
   )
 }
 
+// A question, problem or note for another item (or host) is not drawn here.
+const ownedBy = (hostId: HostId, id: string) => <T extends Target>(value: T | null): T | null =>
+  value !== null && value.hostId === hostId && value.id === id ? value : null
+
+function deleteQuestion(pending: PendingDelete, text: string, busy: boolean): OrcaNode {
+  return (
+    <Callout key="confirm" tone="danger" title={`Delete ${pending.name}?`}>
+      <Stack gap="sm">
+        <Text>{text}</Text>
+        <Row gap="xs">
+          <Button key="confirm-delete" tone="danger" disabled={busy} onPress={confirmDelete}>Delete</Button>
+          <Button key="cancel-delete" variant="ghost" onPress={() => set(pendingDelete, null)}>Cancel</Button>
+        </Row>
+      </Stack>
+    </Callout>
+  )
+}
+
 function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
   const busy = read(working)
   const allowed = allowedActions(container.state)
@@ -400,10 +486,9 @@ function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
   const act = (action: ContainerAction) => () => void containerAction(view.hostId, action, container.id)
   const terminal = (kind: TerminalKind) => () => void openTerminal(view.hostId, kind, container.id, container.name)
   const showLogs = () => openLogs(view.hostId, container.id)
-  const askDelete = () => set(pendingDelete, { hostId: view.hostId, id: container.id, name: container.name })
-  // A question, problem or note for another container (or host) is not drawn here.
-  const own = <T extends Target>(value: T | null): T | null =>
-    value !== null && value.hostId === view.hostId && value.id === container.id ? value : null
+  const askDelete = () =>
+    set(pendingDelete, { hostId: view.hostId, id: container.id, name: container.name, kind: 'container', ref: container.id })
+  const own = ownedBy(view.hostId, container.id)
   const pending = own(read(pendingDelete))
   const problem = own(read(actionProblem))?.problem ?? null
   const opened = own(read(openedNote))?.text ?? null
@@ -423,17 +508,41 @@ function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
           {busy ? <Spinner label="Working" /> : null}
         </Row>
         {opened === null ? null : <Text muted size="sm">{opened}</Text>}
-        {pending === null ? null : (
-          <Callout key="confirm" tone="danger" title={`Delete ${pending.name}?`}>
-            <Stack gap="sm">
-              <Text>The container is removed from the host. This cannot be undone.</Text>
-              <Row gap="xs">
-                <Button key="confirm-delete" tone="danger" disabled={busy} onPress={confirmDelete}>Delete</Button>
-                <Button key="cancel-delete" variant="ghost" onPress={() => set(pendingDelete, null)}>Cancel</Button>
-              </Row>
-            </Stack>
-          </Callout>
-        )}
+        {pending === null ? null : deleteQuestion(pending, 'The container is removed from the host. This cannot be undone.', busy)}
+        {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
+      </Stack>
+    </Card>
+  )
+}
+
+const TOOLBAR_LABEL: Record<ResourceKind, string> = { image: 'Image actions', volume: 'Volume actions', network: 'Network actions' }
+
+// The card of the selected image tag, volume or network: what it is, Pull (an image with a repository and tag), Delete.
+function resourceCard(view: HostView, details: ResourceDetails): OrcaNode {
+  const busy = read(working)
+  const { kind, key, title, removeRef, removeBlocked, pullRef } = details
+  const askDelete = () => set(pendingDelete, { hostId: view.hostId, id: key, name: title, kind, ref: removeRef })
+  const own = ownedBy(view.hostId, key)
+  const pending = own(read(pendingDelete))
+  const problem = own(read(actionProblem))?.problem ?? null
+  const opened = own(read(openedNote))?.text ?? null
+  return (
+    <Card key="details" title={title}>
+      <Stack gap="sm">
+        <KeyValue items={details.items} />
+        <Row gap="sm" align="center" wrap>
+          <Toolbar label={TOOLBAR_LABEL[kind]}>
+            {pullRef === null ? null : (
+              <Button key="pull" size="sm" icon="download" disabled={busy} onPress={() => void pullImage(view.hostId, key, pullRef)}>Pull</Button>
+            )}
+            <Button key="delete" size="sm" icon="delete" tone="danger" variant="outline" disabled={busy || removeBlocked !== null}
+              onPress={askDelete}>Delete</Button>
+          </Toolbar>
+          {busy ? <Spinner label="Working" /> : null}
+        </Row>
+        {removeBlocked === null ? null : <Text key="delete-blocked" muted size="sm">{removeBlocked}</Text>}
+        {opened === null ? null : <Text muted size="sm">{opened}</Text>}
+        {pending === null ? null : deleteQuestion(pending, details.removeText, busy)}
         {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
       </Stack>
     </Card>
@@ -498,8 +607,8 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
           label="Containers"
           items={items}
           maxHeight="lg"
-          // '' keeps the Tree controlled when nothing is selected; undefined would let it keep its own pick.
-          selected={selected ?? ''}
+          // '' keeps the Tree controlled when no container is selected; undefined would let it keep its own pick.
+          selected={container?.id ?? ''}
           expanded={items.filter((item) => item.children !== undefined && !collapsed.includes(item.key)).map((item) => item.key)}
           onSelect={({ key }) => pickItem(key)}
           onToggle={({ key, expanded }) => toggleProject(key, expanded)}
@@ -512,8 +621,53 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
   )
 }
 
-function readOnlyTree(label: string, noun: string, items: TreeItem[], total: number): OrcaNode {
-  return items.length === 0 ? emptyLine(noun, total) : <Tree key={`${noun}-tree`} label={label} items={items} maxHeight="lg" />
+// "Image to pull" and its Pull button, at the top of the Images section, with what came of the last pull.
+function pullRow(view: HostView): OrcaNode {
+  const text = read(pullText)
+  const error = read(pullError)
+  const own = ownedBy(view.hostId, PULL_ROW)
+  const problem = own(read(actionProblem))?.problem ?? null
+  const opened = own(read(openedNote))?.text ?? null
+  return (
+    <Stack key="pull-row" gap="xs">
+      <Row gap="xs" align="end">
+        <Input key="pull-ref" label="Image to pull" labelHidden placeholder="nginx:latest" value={text} invalid={error !== null}
+          onChange={changePullText} />
+        <Button key="pull-by-name" size="sm" icon="download" disabled={read(working) || text.trim() === ''}
+          onPress={() => pullByName(view.hostId)}>Pull</Button>
+      </Row>
+      {error === null ? null : <Text key="pull-error" tone="danger" size="sm">{error}</Text>}
+      {opened === null ? null : <Text key="pull-opened" muted size="sm">{opened}</Text>}
+      {problem === null ? null : problemCallout(problem, 'danger', 'pull-problem')}
+    </Stack>
+  )
+}
+
+const RESOURCE_SECTION: Record<ResourceKind, { label: string; noun: string }> = {
+  image: { label: 'Images', noun: 'images' }, volume: { label: 'Volumes', noun: 'volumes' }, network: { label: 'Networks', noun: 'networks' },
+}
+
+// A section's tree and, under it, the card of its selected row. Images also get the pull row, and their repository
+// rows toggle like Compose projects.
+function resourceBody(view: HostView, snapshot: Snapshot, kind: ResourceKind, items: TreeItem[], total: number): OrcaNode {
+  const { label, noun } = RESOURCE_SECTION[kind]
+  const selected = read(selection)
+  const details = selected !== null && resourceKindOf(selected) === kind ? resourceDetails(snapshot, selected) : null
+  const repos = read(expandedRepos)
+  const groups = kind !== 'image' ? {} : {
+    expanded: items.filter((item) => repos.includes(item.key)).map((item) => item.key),
+    onToggle: ({ key, expanded }: { key: string; expanded: boolean }) => toggleRepo(key, expanded),
+  }
+  return (
+    <Stack gap="sm">
+      {kind === 'image' ? pullRow(view) : null}
+      {items.length === 0 ? emptyLine(noun, total) : (
+        <Tree key={`${noun}-tree`} label={label} items={items} maxHeight="lg" selected={details?.key ?? ''}
+          onSelect={({ key }) => pickItem(key)} {...groups} />
+      )}
+      {details === null ? null : resourceCard(view, details)}
+    </Stack>
+  )
 }
 
 // A closed section draws nothing inside, so hundreds of images cost nothing until it opens.
@@ -552,11 +706,12 @@ function hostBody(): OrcaNode {
       {view.problem === null ? null : problemCallout(view.problem, 'warning', 'snapshot-problem')}
       {section('containers', 'Containers', `${runningCount(containers)} running / ${containers.length}`,
         () => containersBody(view, snapshot, filter))}
-      {section('images', 'Images', `${images.length}`, () => readOnlyTree('Images', 'images', imageTree(images, filter), images.length))}
+      {section('images', 'Images', `${images.length}`,
+        () => resourceBody(view, snapshot, 'image', imageTree(images, filter), images.length))}
       {section('volumes', 'Volumes', `${volumes.length}`,
-        () => readOnlyTree('Volumes', 'volumes', volumeTree(volumes, filter), volumes.length))}
+        () => resourceBody(view, snapshot, 'volume', volumeTree(volumes, filter), volumes.length))}
       {section('networks', 'Networks', `${networks.length}`,
-        () => readOnlyTree('Networks', 'networks', networkTree(networks, filter), networks.length))}
+        () => resourceBody(view, snapshot, 'network', networkTree(networks, filter), networks.length))}
     </Stack>
   )
 }

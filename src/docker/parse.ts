@@ -41,6 +41,9 @@ function composeLabel(row: Json, key: 'project' | 'service'): string {
   return match?.[1] === undefined ? '' : cleanLabel(match[1], LABEL_MAX)
 }
 
+// Docker's own lead-in, dropped from a failed message so the reason survives the 200-character cut.
+const DAEMON_PREFIX = 'Error response from daemon: '
+
 export function classifyFailure(result: CommandResult): Problem {
   const text = result.lines.join('\n').toLowerCase()
   if (result.code === 124) return { kind: 'timeout', message: 'The command timed out' }
@@ -49,8 +52,10 @@ export function classifyFailure(result: CommandResult): Problem {
   if (text.includes('cannot connect to the docker daemon') || text.includes('is the docker daemon running')) {
     return { kind: 'daemon-down', message: 'The Docker daemon is not running' }
   }
-  const first = result.lines.find((line) => line.trim() !== '' && parseJsonLine(line) === null)
-  return { kind: 'failed', message: first === undefined ? `${result.name} failed with exit code ${result.code}` : cleanLabel(first.trim(), LABEL_MAX) }
+  const first = result.lines.find((line) => line.trim() !== '' && parseJsonLine(line) === null)?.trim()
+  if (first === undefined) return { kind: 'failed', message: `${result.name} failed with exit code ${result.code}` }
+  const reason = first.startsWith(DAEMON_PREFIX) ? first.slice(DAEMON_PREFIX.length) : first
+  return { kind: 'failed', message: cleanLabel(reason, LABEL_MAX) }
 }
 
 function toState(value: string): ContainerState {

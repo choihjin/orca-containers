@@ -3,8 +3,9 @@
 ![이 Mac과 SSH 호스트의 Containers 패널](assets/cover.png)
 
 [Orca](https://github.com/stablyai/orca) 사이드바 패널에서 Docker 컨테이너를 보고 관리합니다. 이 Mac과
-Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너, 이미지, 볼륨, 네트워크를 볼 수 있습니다(이미지,
-볼륨, 네트워크는 보기만 가능). 컨테이너는 시작, 중지, 재시작하거나 로그를 보고 셸을 열고 삭제할 수 있습니다.
+Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너, 이미지, 볼륨, 네트워크를 볼 수 있습니다. 컨테이너는
+시작, 중지, 재시작하거나 로그를 보고 셸을 열고 삭제할 수 있습니다. 이미지, 볼륨, 네트워크는 삭제할 수 있고,
+이미지는 Orca 터미널에서 pull할 수 있습니다.
 
 [English](README.md)
 
@@ -23,6 +24,14 @@ Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너,
   나오고, 그 카드에서 Start, Stop, Restart, Logs, Shell, Delete를 쓸 수 있습니다. Delete는 확인을 거치고,
   실행 중인 컨테이너에는 비활성화됩니다. 컨테이너에서 Enter를 누르거나 더블클릭하면 로그가 열립니다. Shell은 해당 호스트에 터미널을 열고, Orca가 그
   터미널을 앞으로 가져오려고 시도합니다. Compose 프로젝트 행을 클릭하면 접히거나 펼쳐집니다.
+- **이미지, 볼륨, 네트워크:** 이미지 태그, 볼륨, 네트워크를 선택하면 상세 정보와 Delete 버튼이 담긴 카드가 나오고,
+  Delete는 확인을 거칩니다. 강제 삭제는 하지 않으므로, 사용 중인 항목(예: 컨테이너가 쓰는 볼륨, 컨테이너가 연결된
+  네트워크)은 Docker가 삭제를 거부하고 카드에 Docker의 메시지가 표시됩니다. 이미지 태그는 이름으로 삭제하고(다른
+  태그가 쓰지 않으면 Docker가 이미지도 지움), 저장소나 태그가 없는 이미지는 ID로 삭제합니다. 기본 네트워크
+  `bridge`, `host`, `none`은 삭제할 수 없습니다. Images의 저장소 행을 클릭하면 접히거나 펼쳐집니다.
+- **이미지 pull:** 이미지 태그 카드의 **Pull**이나 Images 섹션에 입력한 이름(예: `nginx:latest`)으로, 해당 호스트의
+  Orca 터미널에서 `docker pull`을 실행합니다. Shell과 같은 방식이라 큰 이미지도 패널 요청 시간 제한을 받지
+  않습니다. 이미지 참조 형식이 아닌 이름은 아무것도 실행하기 전에 패널이 거부합니다.
 - **패널 안의 로그:** Logs를 누르면 컨테이너 로그의 마지막 200줄이 색상 코드 없이 카드 아래에 나오고, 패널이 보이는
   동안 새로 고쳐집니다. 이 Mac은 3초, SSH 호스트는 10초 간격입니다. 다른 컨테이너를 고르면 로그도 그 컨테이너로
   바뀝니다. **Open in terminal**을 누르면 해당 호스트의 Orca 터미널에서 로그를 실시간으로 따라가고, Orca가 그 터미널을
@@ -39,8 +48,8 @@ Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너,
   로그인해야 합니다(예: ssh-agent에 올린 키). 확인하려면 이 Mac의 터미널에서
   `ssh -o BatchMode=yes <호스트 이름> true`를 실행해 보세요. 오류 없이 끝나야 합니다. 호스트 이름은 영문자, 숫자,
   `.`, `_`, `-`로 이루어지고 첫 글자가 영문자나 숫자여야 합니다. 그 밖의 이름은 ssh로 쓸 수 없습니다.
-- 목록, 동작, 패널 안의 로그에는 이 ssh 로그인만 있으면 됩니다. SSH 호스트에서 Shell과 **Open in terminal**을
-  쓰려면 Orca에 그 호스트의 워크스페이스가 있고, 그 호스트에 대한 Orca 자체 연결도 있어야 합니다.
+- 목록, 동작(삭제 포함), 패널 안의 로그에는 이 ssh 로그인만 있으면 됩니다. SSH 호스트에서 Shell, **Open in
+  terminal**, Pull을 쓰려면 Orca에 그 호스트의 워크스페이스가 있고, 그 호스트에 대한 Orca 자체 연결도 있어야 합니다.
 
 ## 설치
 
@@ -48,10 +57,10 @@ Orca에서 **Settings → Plugins**를 열고 **Add plugin → From a Git URL…
 저장소 주소를 붙여 넣어 설치합니다.
 
 ```text
-https://github.com/choihjin/orca-containers#v0.1.2
+https://github.com/choihjin/orca-containers#v0.2.0
 ```
 
-터미널에서는 `orca plugin install choihjin/orca-containers@v0.1.2`으로도 설치할 수 있습니다.
+터미널에서는 `orca plugin install choihjin/orca-containers@v0.2.0`으로도 설치할 수 있습니다.
 
 Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. 확인한 뒤 켜세요.
 
@@ -61,12 +70,12 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
 - **이 Mac에서 `docker` 찾기:** `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`에 `docker`가 없으면 워커가
   `/bin/zsh -lc 'command -v docker'`를 실행합니다. 이때 zsh 로그인 시작 파일(`~/.zshenv`, `~/.zprofile`,
   `~/.zlogin`)이 실행됩니다. 찾은 경로는 다시 쓰고, 찾지 못하는 동안은 새로 고칠 때마다 다시 실행합니다.
-- **SSH 호스트:** 목록, 동작, 패널 안의 로그는 이 Mac에서 `ssh <호스트 이름>`을 실행합니다. ssh 접속 대상은
+- **SSH 호스트:** 목록, 동작(삭제 포함), 패널 안의 로그는 이 Mac에서 `ssh <호스트 이름>`을 실행합니다. ssh 접속 대상은
   Orca 호스트 이름 그대로이고, 그 호스트의 `sh`에 정해진 스크립트를 보냅니다. 터미널은 열지 않습니다.
   ssh만 있으면 되고, Orca가 그 호스트에 연결되는지나 그 호스트에 워크스페이스가 있는지는 상관없습니다.
   ssh는 `BatchMode=yes`로 실행하므로 비밀번호나 passphrase를 묻지 않습니다. 프롬프트 없이 로그인할 수 없는
   호스트에는 "SSH connection failed"와 함께 고칠 점이 표시됩니다. 60초가 지나도 끝나지 않은 ssh 실행은 멈춥니다.
-- **SSH 호스트의 터미널:** 터미널은 Shell과 **Open in terminal**을 누를 때만 열립니다. Orca 자체 명령줄
+- **SSH 호스트의 터미널:** 터미널은 Shell, **Open in terminal**, Pull을 누를 때만 열립니다. Orca 자체 명령줄
   도구(`orca … --environment <호스트>`)로 그 호스트의 워크스페이스에 Orca 터미널을 엽니다. 그래서 Orca에 그
   호스트의 워크스페이스가 있고 그 호스트에 대한 Orca 자체 연결도 있어야 합니다. 그렇지 않으면 패널에 "Host
   unreachable"(Orca가 호스트에 연결하지 못함)이나 "No workspace on this host"가 표시됩니다.
@@ -77,12 +86,12 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
 | --- | --- |
 | 별도 Node.js 프로세스에서, 이 컴퓨터에 대한 내 사용자 계정 권한으로 자체 코드 실행 (`trusted-worker`) | 워커가 `docker`, `ssh`, Orca 명령줄 도구를 실행해야 함 |
 | `workspace:read` | 포커스된 워크스페이스와 이 Mac의 워크스페이스 목록을 읽고, 포커스된 워크스페이스가 바뀌는 것을 받음 (포커스된 워크스페이스 따라가기용) |
-| `terminal:send` | 이 Mac의 워크스페이스에 실시간 로그(Open in terminal)와 Shell 터미널을 열고 정해진 docker 명령을 실행 |
+| `terminal:send` | 이 Mac의 워크스페이스에 실시간 로그(Open in terminal), Shell, Pull 터미널을 열고 정해진 docker 명령을 실행 |
 | `storage:own` | 플러그인 전용 저장 폴더에 데이터 저장 |
 | `settings:own` | 플러그인 자체 설정을 읽고 변경 |
 
 워커가 `docker`, `ssh`, Orca 명령줄 도구를 실행하는 것은 Orca의 승인 목록에 따로 나타나지 않습니다. 위의
-`trusted-worker` 권한에 포함됩니다. SSH 호스트의 터미널(Shell과 Open in terminal)은 Orca 명령줄 도구를
+`trusted-worker` 권한에 포함됩니다. SSH 호스트의 터미널(Shell, Open in terminal, Pull)은 Orca 명령줄 도구를
 통해 엽니다.
 
 ## 한계
@@ -91,14 +100,14 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
 - SSH 호스트의 응답이 64 MiB를 넘으면 보여 주지 않고 패널에 "List too long"이 표시됩니다.
 - 패널의 로그는 한 줄을 500자에서 자르고, 15,000자 안에 들어가는 최근 줄만 보여 줍니다. Open in terminal에서는
   잘리지 않고 보입니다.
-- SSH 호스트의 로그인 셸 시작 파일이 tmux나 screen을 자동으로 붙이면, Shell이나 Open in terminal의 docker 명령이
-  그 프로그램에 입력될 수 있습니다.
+- SSH 호스트의 로그인 셸 시작 파일이 tmux나 screen을 자동으로 붙이면, Shell, Open in terminal, Pull의 docker
+  명령이 그 프로그램에 입력될 수 있습니다.
 
 ## v1에 없는 것
 
-이후 버전에서 하려는 일입니다. 각 항목은 착수 전에 시험으로 확인합니다. Compose up/down, 이미지·볼륨·네트워크
-삭제와 pull, Linux나 Windows의 Orca, macOS SSH 호스트, 1.4.255보다 오래된 Orca, 한국어 UI, 로그인 셸이 tmux나
-screen을 자동으로 붙이는 SSH 호스트 감지.
+이후 버전에서 하려는 일입니다. 각 항목은 착수 전에 시험으로 확인합니다. Compose up/down, Linux나 Windows의
+Orca, macOS SSH 호스트, 1.4.255보다 오래된 Orca, 한국어 UI, 로그인 셸이 tmux나 screen을 자동으로 붙이는 SSH
+호스트 감지.
 
 ## 개발
 

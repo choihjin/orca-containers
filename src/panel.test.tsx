@@ -48,10 +48,14 @@ function requests(overrides: MockRequests = {}): MockRequests {
     'docker.action': () => ok({ done: true as const }),
     'docker.openTerminal': () => ok({ opened: true as const, workspace: 'proj' }),
     'docker.logs': ({ containerId }) => ok({ lines: [`${containerId} started`, `${containerId} ready`], takenAt: 2_000 }),
+    'docker.removeResource': () => ok({ done: true as const }),
+    'docker.pullTerminal': () => ok({ opened: true as const, workspace: 'proj' }),
     ...overrides,
   }
 }
 const composeOnLocal: MockRequests = { 'docker.snapshot': ({ hostId }) => ok(snap(hostId, COMPOSE)) }
+// What the daemon says when it refuses a restart (the worker drops docker's "Error response from daemon: ").
+const RESTART_REFUSED = 'Cannot restart container aaaaaaaaaaaa: container is marked for removal and cannot be started'
 
 type Sent = { name: string; input?: unknown; timeoutMs?: number }
 let view: TestPanel | undefined
@@ -497,7 +501,7 @@ test("shows an action's problem and note only in the card of the container it wa
       selecting = view!.selectItem(CONTAINERS, DB)
       await new Promise((resolve) => setImmediate(resolve))
       cardDuring = card(view!)?.label
-      return { ok: false, problem: { kind: 'failed', message: 'Error response from daemon: conflict' } }
+      return { ok: false, problem: { kind: 'failed', message: RESTART_REFUSED } }
     },
   })
   const failed = () => v.find({ label: 'Command failed' })
@@ -547,13 +551,13 @@ test('refreshes the host after an action', async () => {
 })
 
 test('shows why an action failed and still refreshes the host', async () => {
-  let answer: () => Result<{ done: true }> = () => ({ ok: false, problem: { kind: 'failed', message: 'Error response from daemon: conflict' } })
+  let answer: () => Result<{ done: true }> = () => ({ ok: false, problem: { kind: 'failed', message: RESTART_REFUSED } })
   const v = await open({ 'docker.action': () => answer() })
   await v.selectItem(CONTAINERS, WEB)
   const before = sent(v, 'docker.snapshot').length
   await v.press({ testId: 'restart' })
   assert.ok(v.summary().includes('Callout danger "Command failed"'), v.summary().join('\n'))
-  assert.ok(v.find({ text: 'Error response from daemon: conflict' }))
+  assert.ok(v.find({ text: RESTART_REFUSED }))
   assert.equal(sent(v, 'docker.snapshot').length, before + 1)
 
   answer = () => { throw hostError('timeout', 'docker.action took longer than 110000 ms') }
@@ -1103,12 +1107,12 @@ test("an old host's late logs answer leaves the new host's request alone", async
 })
 
 test('a logs failure shows the problem copy in the log box', async () => {
-  let answer: () => LogsAnswer = () => ({ ok: false, problem: { kind: 'failed', message: 'Error response from daemon: No such container' } })
+  let answer: () => LogsAnswer = () => ({ ok: false, problem: { kind: 'failed', message: 'No such container: aaaaaaaaaaaa' } })
   const v = await open({ 'docker.logs': () => answer() })
   await v.selectItem(CONTAINERS, WEB)
   await v.press({ testId: 'logs' })
   assert.ok(v.summary().includes('EmptyState "Command failed"'), v.summary().join('\n'))
-  assert.ok(v.find({ text: 'Error response from daemon: No such container' }))
+  assert.ok(v.find({ text: 'No such container: aaaaaaaaaaaa' }))
   assert.equal(v.find(LOGS), null)
   assert.ok(v.find({ label: 'Refresh logs' }))
 
@@ -1249,5 +1253,461 @@ test('the log view follows the selected container and closes with the selection,
   await v.toggle(section('Containers'))
   assert.equal(card(v)?.label, 'web')
   assert.equal(v.find(LOGS), null)
+  clean(v)
+})
+
+// Images, volumes and networks as a host lists them: two tags of one image, an untagged image, a volume,
+// a built-in network and one of a Compose project.
+const NGINX_ID = `sha256:5f1e6a2b0c3d${'0'.repeat(52)}`
+const UNTAGGED_ID = `sha256:${'9'.repeat(64)}`
+const BRIDGE_ID = 'e'.repeat(64)
+const ML_NET_ID = '7'.repeat(64)
+const NGINX_LATEST = `image:${NGINX_ID}:latest`
+const NGINX_STABLE = `image:${NGINX_ID}:stable`
+const UNTAGGED = `image:${UNTAGGED_ID}:<none>`
+const PGDATA = 'volume:pgdata'
+const BRIDGE = `network:${BRIDGE_ID}`
+const ML_NET = `network:${ML_NET_ID}`
+const resourceSnap = (hostId: HostId, containers: ContainerRow[] = LOCAL): Snapshot => ({
+  ...snap(hostId, containers),
+  images: [
+    { id: NGINX_ID, repository: 'nginx', tag: 'latest', size: '192MB', createdSince: '2 weeks ago' },
+    { id: NGINX_ID, repository: 'nginx', tag: 'stable', size: '192MB', createdSince: '2 weeks ago' },
+    { id: UNTAGGED_ID, repository: '<none>', tag: '<none>', size: '1.2GB', createdSince: '3 months ago' },
+  ],
+  volumes: [{ name: 'pgdata', driver: 'local' }],
+  networks: [
+    { id: BRIDGE_ID, name: 'bridge', driver: 'bridge', scope: 'local' },
+    { id: ML_NET_ID, name: 'ml_default', driver: 'bridge', scope: 'local' },
+  ],
+})
+const withResources: MockRequests = { 'docker.snapshot': ({ hostId }) => ok(resourceSnap(hostId)) }
+const IMAGES = { type: 'Tree', label: 'Images' }
+const VOLUMES = { type: 'Tree', label: 'Volumes' }
+const NETWORKS = { type: 'Tree', label: 'Networks' }
+const PULL_INPUT = { label: 'Image to pull' }
+const PULL_BY_NAME = { testId: 'pull-by-name' }
+async function openResources(overrides: MockRequests = {}): Promise<TestPanel> {
+  const v = await open({ ...withResources, ...overrides })
+  for (const label of ['Images', 'Volumes', 'Networks']) await v.toggle(section(label))
+  return v
+}
+
+test('selecting an image tag, a volume or a network shows its card, one card at a time', async () => {
+  const v = await openResources()
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  assert.equal(v.valueOf(IMAGES), NGINX_LATEST)
+  assert.equal(card(v)?.label, 'nginx:latest')
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [
+    { label: 'ID', value: '5f1e6a2b0c3d', code: true }, { label: 'Size', value: '192MB' }, { label: 'Created', value: '2 weeks ago' },
+  ])
+  assert.deepEqual(v.find({ type: 'Toolbar' })?.label, 'Image actions')
+  assert.deepEqual([v.find({ testId: 'pull' })?.disabled, v.find({ testId: 'delete' })?.disabled], [false, false])
+  // The other trees hold no selection.
+  assert.deepEqual([v.valueOf(CONTAINERS), v.valueOf(VOLUMES), v.valueOf(NETWORKS)], ['', '', ''])
+
+  await v.selectItem(VOLUMES, PGDATA)
+  assert.deepEqual([v.valueOf(IMAGES), v.valueOf(VOLUMES)], ['', PGDATA])
+  assert.equal(card(v)?.label, 'pgdata')
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [{ label: 'Driver', value: 'local' }])
+  assert.deepEqual([v.find({ testId: 'pull' }), v.find({ testId: 'delete' })?.disabled], [null, false])
+
+  await v.selectItem(NETWORKS, ML_NET)
+  assert.equal(card(v)?.label, 'ml_default')
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [
+    { label: 'Driver', value: 'bridge' }, { label: 'Scope', value: 'local' }, { label: 'ID', value: '777777777777', code: true },
+  ])
+  assert.deepEqual([v.find({ testId: 'pull' }), v.find({ testId: 'delete' })?.disabled], [null, false])
+  assert.equal(v.findAll({ type: 'Card' }).length, 1)
+
+  // A container takes the selection back.
+  await v.selectItem(CONTAINERS, DB)
+  assert.deepEqual([card(v)?.label, v.valueOf(NETWORKS)], ['db', ''])
+  assert.equal(v.findAll({ type: 'Card' }).length, 1)
+  // Picking sends nothing.
+  for (const name of ['docker.removeResource', 'docker.pullTerminal', 'docker.action']) assert.equal(sent(v, name).length, 0, name)
+  clean(v)
+})
+
+test('a repository row toggles like a Compose project and selects nothing', async () => {
+  const v = await openResources()
+  const expandedProp = () => v.find(IMAGES)?.props.expanded
+  assert.deepEqual(expandedProp(), [])
+  const before = v.host.callsOf('plugin.request').length
+  await v.selectItem(IMAGES, 'repo:nginx')
+  assert.deepEqual(expandedProp(), ['repo:nginx'])
+  assert.equal(card(v), null)
+  assert.equal(v.valueOf(IMAGES), '')
+  await v.selectItem(IMAGES, NGINX_STABLE)
+  await v.selectItem(IMAGES, 'repo:nginx')
+  assert.deepEqual(expandedProp(), [])
+  assert.equal(v.valueOf(IMAGES), NGINX_STABLE)
+  assert.equal(card(v)?.label, 'nginx:stable')
+  // The arrow works the same way.
+  await v.expand(IMAGES, 'repo:<none>')
+  assert.deepEqual(expandedProp(), ['repo:<none>'])
+  await v.collapse(IMAGES, 'repo:<none>')
+  assert.deepEqual(expandedProp(), [])
+  assert.equal(v.host.callsOf('plugin.request').length, before)
+
+  // Another host starts with every repository collapsed again.
+  await v.selectItem(IMAGES, 'repo:nginx')
+  await v.select(HOST, 'ssh:GPU1')
+  await v.select(HOST, 'local')
+  assert.deepEqual(expandedProp(), [])
+  clean(v)
+})
+
+test('deleting an image tag, a volume or a network takes two presses and sends its kind and reference', async () => {
+  const v = await openResources()
+  const cases = [
+    { tree: IMAGES, key: NGINX_LATEST, question: 'Delete nginx:latest?', kind: 'image', ref: 'nginx:latest' },
+    { tree: VOLUMES, key: PGDATA, question: 'Delete pgdata?', kind: 'volume', ref: 'pgdata' },
+    { tree: NETWORKS, key: ML_NET, question: 'Delete ml_default?', kind: 'network', ref: ML_NET_ID },
+  ]
+  const removed: unknown[] = []
+  for (const { tree, key, question, kind, ref } of cases) {
+    await v.selectItem(tree, key)
+    await v.press({ testId: 'delete' })
+    assert.ok(v.summary().includes(`Callout danger "${question}"`), v.summary().join('\n'))
+    assert.equal(sent(v, 'docker.removeResource').length, removed.length, question)
+    await v.press({ testId: 'cancel-delete' })
+    assert.equal(v.find({ label: question }), null)
+    assert.equal(sent(v, 'docker.removeResource').length, removed.length, question)
+
+    await v.press({ testId: 'delete' })
+    const snapshots = sent(v, 'docker.snapshot').length
+    await v.press({ testId: 'confirm-delete' })
+    removed.push([{ hostId: 'local', kind, ref }, 110_000])
+    assert.deepEqual(sent(v, 'docker.removeResource').map((c) => [c.input, c.timeoutMs]), removed)
+    // Done: the selection clears and the host is read again.
+    assert.equal(card(v), null, question)
+    assert.equal(v.valueOf(tree), '', question)
+    assert.equal(v.find({ label: question }), null)
+    assert.equal(sent(v, 'docker.snapshot').length, snapshots + 1, question)
+  }
+  assert.equal(sent(v, 'docker.action').length, 0)
+  clean(v)
+})
+
+test('the delete question names what it removes', async () => {
+  const v = await openResources()
+  const question = async (tree: typeof IMAGES, key: string) => {
+    await v.selectItem(tree, key)
+    await v.press({ testId: 'delete' })
+    return v.find({ type: 'Callout' })?.text
+  }
+  assert.match(await question(IMAGES, NGINX_LATEST) ?? '', /The tag is removed, and the image too when no other tag uses it\./)
+  assert.match(await question(IMAGES, UNTAGGED) ?? '', /The image is removed from the host\./)
+  assert.match(await question(VOLUMES, PGDATA) ?? '', /The volume and its data are removed from the host\./)
+  assert.match(await question(NETWORKS, ML_NET) ?? '', /The network is removed from the host\./)
+  assert.equal(sent(v, 'docker.removeResource').length, 0)
+  clean(v)
+})
+
+test('the pending resource delete clears when the selection, the host, the filter or its section changes, and survives a refresh', async () => {
+  let rows = resourceSnap('local')
+  const v = await openResources({ 'docker.snapshot': ({ hostId }) => ok(hostId === 'local' ? rows : resourceSnap(hostId)) })
+  const question = () => v.find({ label: 'Delete nginx:latest?' })
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  await v.press({ testId: 'delete' })
+  // A refresh that still lists it keeps the question.
+  await v.press({ label: 'Refresh' })
+  assert.ok(question(), v.summary().join('\n'))
+
+  await v.selectItem(VOLUMES, PGDATA)
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  assert.equal(question(), null)
+
+  await v.press({ testId: 'delete' })
+  await v.select(HOST, 'ssh:GPU1')
+  await v.select(HOST, 'local')
+  assert.equal(card(v), null)
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  assert.equal(question(), null)
+
+  // A filter that hides it clears the selection with the question.
+  await v.press({ testId: 'delete' })
+  await v.type(FILTER, 'stable')
+  assert.equal(card(v), null)
+  await v.type(FILTER, '', { replace: true })
+  assert.equal(card(v), null)
+  assert.equal(question(), null)
+
+  // Closing its section drops the question; closing another section does not.
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  await v.press({ testId: 'delete' })
+  await v.toggle(section('Containers'))
+  assert.ok(question())
+  await v.toggle(section('Images'))
+  await v.toggle(section('Images'))
+  assert.equal(card(v)?.label, 'nginx:latest')
+  assert.equal(question(), null)
+
+  // Gone from the host: the card and the question go.
+  await v.press({ testId: 'delete' })
+  rows = { ...rows, images: rows.images.filter((i) => i.tag !== 'latest') }
+  await v.press({ label: 'Refresh' })
+  assert.equal(card(v), null)
+  assert.equal(question(), null)
+  assert.equal(sent(v, 'docker.removeResource').length, 0)
+  clean(v)
+})
+
+test("Docker's built-in networks cannot be deleted from their card", async () => {
+  const v = await openResources()
+  const hint = () => v.find({ text: "Docker's built-in networks cannot be deleted." })
+  await v.selectItem(NETWORKS, BRIDGE)
+  assert.equal(card(v)?.label, 'bridge')
+  assert.equal(v.find({ testId: 'delete' })?.disabled, true)
+  assert.ok(hint(), v.summary().join('\n'))
+  await v.selectItem(NETWORKS, ML_NET)
+  assert.equal(v.find({ testId: 'delete' })?.disabled, false)
+  assert.equal(hint(), null)
+  assert.equal(sent(v, 'docker.removeResource').length, 0)
+  clean(v)
+})
+
+test("a refused delete shows the daemon's message on the card, which stays selected", async () => {
+  const inUse = 'remove pgdata: volume is in use - [0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef]'
+  let answer: () => Result<{ done: true }> = () => ({ ok: false, problem: { kind: 'failed', message: inUse } })
+  const v = await openResources({ 'docker.removeResource': () => answer() })
+  await v.selectItem(VOLUMES, PGDATA)
+  await v.press({ testId: 'delete' })
+  await v.press({ testId: 'confirm-delete' })
+  assert.ok(v.summary().includes('Callout danger "Command failed"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: inUse }))
+  assert.equal(card(v)?.label, 'pgdata')
+  assert.equal(v.valueOf(VOLUMES), PGDATA)
+  // The problem belongs to its card.
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  assert.equal(v.find({ text: inUse }), null)
+  await v.selectItem(VOLUMES, PGDATA)
+  assert.ok(v.find({ text: inUse }))
+
+  answer = () => { throw hostError('timeout', 'docker.removeResource took longer than 110000 ms') }
+  await v.press({ testId: 'delete' })
+  await v.press({ testId: 'confirm-delete' })
+  assert.ok(v.find({ text: 'timeout: docker.removeResource took longer than 110000 ms' }), v.summary().join('\n'))
+  assert.equal(v.find({ text: inUse }), null)
+  assert.equal(card(v)?.label, 'pgdata')
+  assert.deepEqual(v.errors, [])
+})
+
+test('selecting an image, a volume or a network closes the container log view and card', async () => {
+  const v = await openResources()
+  for (const [tree, key] of [[IMAGES, NGINX_LATEST], [VOLUMES, PGDATA], [NETWORKS, ML_NET]] as const) {
+    await v.selectItem(CONTAINERS, WEB)
+    await v.press({ testId: 'logs' })
+    assert.ok(v.find(LOGS))
+    await v.selectItem(tree, key)
+    assert.equal(v.find(LOGS), null, key)
+    assert.equal(v.find({ label: 'Close logs' }), null, key)
+    assert.equal(v.valueOf(CONTAINERS), '', key)
+    assert.equal(v.find({ type: 'Card', label: 'web' }), null, key)
+    assert.equal(v.findAll({ type: 'Card' }).length, 1, key)
+    // Back on the container, the log view stays closed.
+    await v.selectItem(CONTAINERS, WEB)
+    assert.equal(v.find(LOGS), null, key)
+  }
+  assert.equal(sent(v, 'docker.logs').length, 3)
+  clean(v)
+})
+
+test('Pull on an image tag opens docker pull for repository:tag and says where', async () => {
+  const v = await openResources()
+  await v.selectItem(IMAGES, NGINX_STABLE)
+  const snapshots = sent(v, 'docker.snapshot').length
+  await v.press({ testId: 'pull' })
+  assert.deepEqual(sent(v, 'docker.pullTerminal').map((c) => [c.input, c.timeoutMs]), [[{ hostId: 'local', ref: 'nginx:stable' }, 110_000]])
+  assert.ok(v.find({ text: 'Opened pull: nginx:stable in proj.' }), v.summary().join('\n'))
+  assert.equal(sent(v, 'docker.snapshot').length, snapshots)
+  assert.equal(sent(v, 'docker.removeResource').length, 0)
+  // The note stays with its card.
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  assert.equal(v.find({ text: 'Opened pull: nginx:stable in proj.' }), null)
+  clean(v)
+})
+
+test('an untagged image has no Pull and is deleted by its id', async () => {
+  const v = await openResources()
+  await v.selectItem(IMAGES, UNTAGGED)
+  assert.equal(card(v)?.label, '999999999999')
+  assert.equal(v.find({ testId: 'pull' }), null)
+  await v.press({ testId: 'delete' })
+  assert.ok(v.find({ label: 'Delete 999999999999?' }), v.summary().join('\n'))
+  await v.press({ testId: 'confirm-delete' })
+  assert.deepEqual(sent(v, 'docker.removeResource').map((c) => c.input), [{ hostId: 'local', kind: 'image', ref: UNTAGGED_ID }])
+  assert.equal(sent(v, 'docker.pullTerminal').length, 0)
+  clean(v)
+})
+
+test('Pull by name: a valid name opens a terminal on the selected host; any other shows an error and sends nothing', async () => {
+  const v = await openResources()
+  const input = v.find(PULL_INPUT)
+  assert.deepEqual([input?.type, input?.props.placeholder, v.valueOf(PULL_INPUT)], ['Input', 'nginx:latest', ''])
+  assert.equal(v.find(PULL_BY_NAME)?.text, 'Pull')
+  assert.equal(v.find(PULL_BY_NAME)?.disabled, true) // nothing typed yet
+  const error = () => v.find({ text: 'Not an image name. Use one like nginx:latest or ghcr.io/org/app:1.2.' })
+
+  for (const bad of ['nginx latest', '-f', '--force', 'a..b', 'x;id', 'nginx@latest', '$(id)']) {
+    await v.type(PULL_INPUT, bad, { replace: true })
+    assert.equal(error(), null, bad)
+    await v.press(PULL_BY_NAME)
+    assert.ok(error(), `${bad}: ${v.summary().join('\n')}`)
+    assert.equal(v.find(PULL_INPUT)?.props.invalid, true, bad)
+  }
+  assert.equal(sent(v, 'docker.pullTerminal').length, 0)
+
+  // Typing clears the error; spaces around the name do not count.
+  await v.type(PULL_INPUT, '  ghcr.io/org/app:1.2 ', { replace: true })
+  assert.equal(error(), null)
+  assert.equal(v.find(PULL_INPUT)?.props.invalid, false)
+  await v.press(PULL_BY_NAME)
+  assert.deepEqual(sent(v, 'docker.pullTerminal').map((c) => [c.input, c.timeoutMs]), [[{ hostId: 'local', ref: 'ghcr.io/org/app:1.2' }, 110_000]])
+  assert.ok(v.find({ text: 'Opened pull: ghcr.io/org/app:1.2 in proj.' }), v.summary().join('\n'))
+  assert.equal(card(v), null)
+
+  await v.select(HOST, 'ssh:GPU1')
+  assert.equal(v.find({ text: 'Opened pull: ghcr.io/org/app:1.2 in proj.' }), null)
+  await v.type(PULL_INPUT, `redis@sha256:${'a'.repeat(64)}`, { replace: true })
+  await v.press(PULL_BY_NAME)
+  assert.deepEqual(sent(v, 'docker.pullTerminal').at(-1)?.input, { hostId: 'ssh:GPU1', ref: `redis@sha256:${'a'.repeat(64)}` })
+  clean(v)
+})
+
+test('a pull that cannot open its terminal says why under the pull row', async () => {
+  const v = await openResources({ 'docker.pullTerminal': () => ({ ok: false, problem: { kind: 'no-workspace', message: 'none' } }) })
+  await v.type(PULL_INPUT, 'nginx:latest')
+  await v.press(PULL_BY_NAME)
+  assert.ok(v.summary().includes('Callout danger "No workspace on this host"'), v.summary().join('\n'))
+  assert.equal(v.find({ text: /^Opened pull/ }), null)
+  // It is the row's problem, not a card's.
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  assert.equal(v.findAll({ type: 'Callout' }).length, 1)
+  clean(v)
+})
+
+test('while a delete runs, every Pull and Delete is disabled', async () => {
+  const disabled = (v: TestPanel) => ({
+    pullByName: v.find(PULL_BY_NAME)?.disabled, pull: v.find({ testId: 'pull' })?.disabled, delete: v.find({ testId: 'delete' })?.disabled,
+  })
+  let during: unknown
+  const v = await openResources({
+    'docker.removeResource': async () => {
+      await nextTurn()
+      const spinner = view!.find({ type: 'Spinner', label: 'Working' }) !== null
+      during = { ...disabled(view!), confirm: view!.find({ testId: 'confirm-delete' }), spinner }
+      return { ok: false, problem: { kind: 'failed', message: 'conflict: unable to remove repository reference "nginx:latest" (must force)' } }
+    },
+  })
+  await v.type(PULL_INPUT, 'redis:7')
+  await v.selectItem(IMAGES, NGINX_LATEST)
+  await v.press({ testId: 'delete' })
+  await v.press({ testId: 'confirm-delete' })
+  assert.deepEqual(during, { pullByName: true, pull: true, delete: true, confirm: null, spinner: true })
+  assert.deepEqual(disabled(v), { pullByName: false, pull: false, delete: false })
+  clean(v)
+})
+
+
+// Each case deletes the first item; the person picks the second while the delete is still out.
+const LATE_PICKS = [
+  { tree: IMAGES, key: NGINX_LATEST, nextTree: VOLUMES, next: PGDATA, nextCard: 'pgdata' },
+  { tree: VOLUMES, key: PGDATA, nextTree: NETWORKS, next: ML_NET, nextCard: 'ml_default' },
+  { tree: NETWORKS, key: ML_NET, nextTree: IMAGES, next: NGINX_STABLE, nextCard: 'nginx:stable' },
+] as const
+
+test('a delete that answers ok after another item was picked leaves that item selected', async () => {
+  let pick: (() => Promise<void>) | null = null
+  let selecting: Promise<void> | undefined
+  const v = await openResources({
+    'docker.removeResource': async () => {
+      selecting = pick?.()
+      await nextTurn()
+      return ok({ done: true as const })
+    },
+  })
+  for (const { tree, key, nextTree, next, nextCard } of LATE_PICKS) {
+    pick = () => view!.selectItem(nextTree, next)
+    await v.selectItem(tree, key)
+    await v.press({ testId: 'delete' })
+    await v.press({ testId: 'confirm-delete' })
+    await selecting
+    await v.settled()
+    assert.equal(card(v)?.label, nextCard, key)
+    assert.equal(v.valueOf(nextTree), next, key)
+  }
+  assert.equal(sent(v, 'docker.removeResource').length, 3)
+  clean(v)
+})
+
+test("a delete's late failure shows only on the card it was for", async () => {
+  const refused = 'remove pgdata: volume is in use - [0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef]'
+  let pick: (() => Promise<void>) | null = null
+  let selecting: Promise<void> | undefined
+  let cardDuring: string | undefined
+  const v = await openResources({
+    'docker.removeResource': async () => {
+      selecting = pick?.()
+      await nextTurn()
+      cardDuring = card(view!)?.label
+      return { ok: false, problem: { kind: 'failed', message: refused } }
+    },
+  })
+  const failed = () => v.find({ label: 'Command failed' })
+  for (const { tree, key, nextTree, next, nextCard } of LATE_PICKS) {
+    pick = () => view!.selectItem(nextTree, next)
+    await v.selectItem(tree, key)
+    await v.press({ testId: 'delete' })
+    await v.press({ testId: 'confirm-delete' })
+    await selecting
+    await v.settled()
+    assert.equal(cardDuring, nextCard, key)
+    assert.equal(card(v)?.label, nextCard, key)
+    assert.equal(failed(), null, key)
+    assert.equal(v.find({ text: refused }), null, key)
+    // Back on the item it was for, the problem shows.
+    await v.selectItem(tree, key)
+    assert.ok(failed(), `${key}: ${v.summary().join('\n')}`)
+  }
+  clean(v)
+})
+
+test("a pull's late note shows only on the card it was for", async () => {
+  let selecting: Promise<void> | undefined
+  const v = await openResources({
+    'docker.pullTerminal': async () => {
+      selecting = view!.selectItem(VOLUMES, PGDATA)
+      await nextTurn()
+      return ok({ opened: true as const, workspace: 'proj' })
+    },
+  })
+  const note = () => v.find({ text: 'Opened pull: nginx:stable in proj.' })
+  await v.selectItem(IMAGES, NGINX_STABLE)
+  await v.press({ testId: 'pull' })
+  await selecting
+  await v.settled()
+  assert.equal(card(v)?.label, 'pgdata')
+  assert.equal(note(), null)
+  assert.equal(v.find({ text: /^Opened pull/ }), null)
+  await v.selectItem(IMAGES, NGINX_STABLE)
+  assert.ok(note(), v.summary().join('\n'))
+  clean(v)
+})
+
+test('the same image tagged in two repositories is deleted by the reference of the row picked', async () => {
+  const twoRepos = (hostId: HostId): Snapshot => {
+    const base = resourceSnap(hostId)
+    return { ...base, images: [...base.images, { id: NGINX_ID, repository: 'myreg/nginx', tag: 'latest', size: '192MB', createdSince: '2 weeks ago' }] }
+  }
+  const v = await openResources({ 'docker.snapshot': ({ hostId }) => ok(twoRepos(hostId)) })
+  assert.deepEqual(keysOf(v, 'Images'), ['repo:myreg/nginx', `${NGINX_LATEST}~2`, 'repo:nginx', NGINX_LATEST, NGINX_STABLE, 'repo:<none>', UNTAGGED])
+  await v.selectItem(IMAGES, `${NGINX_LATEST}~2`)
+  assert.equal(card(v)?.label, 'myreg/nginx:latest')
+  await v.press({ testId: 'delete' })
+  assert.ok(v.find({ label: 'Delete myreg/nginx:latest?' }), v.summary().join('\n'))
+  await v.press({ testId: 'confirm-delete' })
+  assert.deepEqual(sent(v, 'docker.removeResource').map((c) => c.input), [{ hostId: 'local', kind: 'image', ref: 'myreg/nginx:latest' }])
   clean(v)
 })

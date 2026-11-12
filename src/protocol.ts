@@ -22,6 +22,7 @@ export type Snapshot = { hostId: HostId; takenAt: number; serverVersion: string;
   images: ImageRow[]; volumes: VolumeRow[]; networks: NetworkRow[] }
 export type ContainerAction = 'start' | 'stop' | 'restart' | 'remove'
 export type TerminalKind = 'logs' | 'shell'
+export type ResourceKind = 'image' | 'volume' | 'network'
 export type FocusContext = { displayName: string; branch: string; terminalIds: string[] }
 export type Opened = { opened: true; workspace: string }
 declare module 'orca' {
@@ -33,5 +34,9 @@ declare module 'orca' {
     'docker.logs': { input: { hostId: HostId; containerId: string }; output: Result<{ lines: string[]; takenAt: number }> }
     // `workspace`: where the tab opened (the local workspace's name, or the SSH anchor path's last part).
     'docker.openTerminal': { input: { hostId: HostId; kind: TerminalKind; containerId: string; containerName: string }; output: Result<Opened> }
+    // `ref`: an image id or reference, a volume name, or a network id. Never forced: Docker refuses an item in use.
+    'docker.removeResource': { input: { hostId: HostId; kind: ResourceKind; ref: string }; output: Result<{ done: true }> }
+    // Opens `docker pull <ref>` in an Orca terminal, as Shell does: a large pull outlasts any panel request.
+    'docker.pullTerminal': { input: { hostId: HostId; ref: string }; output: Result<Opened> }
   }
 }

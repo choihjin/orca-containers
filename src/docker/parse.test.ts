@@ -105,6 +105,22 @@ describe('docker parsing', () => {
     assert.deepEqual(classifyFailure({ name: 'ps', code: 1, lines: ['{"a":1}', '', 'boom', 'more'] }), { kind: 'failed', message: 'boom' })
   })
 
+  test('a failed message drops the daemon prefix before the 200-character cut, so the useful part survives', () => {
+    const prefix = 'Error response from daemon: '
+    const inUse = 'conflict: unable to remove repository reference "registry.example.com/platform-team/inference-gateway-service:2026.11.12-b4821"'
+      + ' (must force) - container 0123456789ab is using its referenced image 5f1e6a2b0c3d'
+    // With the prefix kept, the cut would fall before the reason.
+    assert.equal(cleanLabel(prefix + inUse, 200).includes('is using its referenced image'), false)
+    const problem = classifyFailure({ name: 'remove', code: 1, lines: [`  ${prefix}${inUse}`] })
+    assert.equal(problem.kind, 'failed')
+    assert.ok(problem.message.includes('is using its referenced image'), problem.message)
+    assert.equal(problem.message, `${inUse.slice(0, 200)}…`)
+    assert.deepEqual(classifyFailure({ name: 'remove', code: 1, lines: [`${prefix}No such image: nginx:9`] }), { kind: 'failed', message: 'No such image: nginx:9' })
+    // Only a leading prefix goes; the kinds are decided as before.
+    assert.deepEqual(classifyFailure({ name: 'remove', code: 1, lines: [`remove failed: ${prefix}x`] }), { kind: 'failed', message: `remove failed: ${prefix}x` })
+    assert.equal(classifyFailure({ name: 'remove', code: 1, lines: [`${prefix}permission denied`] }).kind, 'permission-denied')
+  })
+
   test('unknown container states become unknown', () => {
     const odd = JSON.stringify({ ID, Names: 'web', Image: 'nginx', State: 'weird', Status: '', Ports: '' })
     const r = buildSnapshot('local', 1, all({ ps: ok('ps', [odd]) }))

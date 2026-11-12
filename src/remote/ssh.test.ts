@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, describe, test } from 'orca/testing'
-import { actionCommand, InvalidInputError, logsCommand, SNAPSHOT_COMMANDS } from '../docker/commands'
+import { actionCommand, InvalidInputError, logsCommand, removeCommand, SNAPSHOT_COMMANDS } from '../docker/commands'
 import type { CommandResult } from '../docker/parse'
 import { MARK, sshScript } from './script'
 import {
@@ -332,6 +332,19 @@ describe('ssh runner', () => {
     const t = setup(() => { ctl.abort(); return { code: 255, stdout: '', stderr: 'Killed by signal 15.' } })
     const res = await t.runner.run(ENV, [STOP], { deadline: 100_000, signal: ctl.signal })
     assert.deepEqual(res, { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } })
+  })
+
+  test('a remove cut off after READY is unknown-result: timed out, aborted after spawning, or overflow', async () => {
+    const UNKNOWN = { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } }
+    const remove = removeCommand('volume', 'pgdata')
+    const timedOut = await setup(() => ({ code: null, timedOut: true, stdout: output(READY) })).runner.run(ENV, [remove], OPTS)
+    assert.deepEqual(timedOut, UNKNOWN, 'timed out')
+    const ctl = new AbortController()
+    const aborted = await setup(() => { ctl.abort(); return { code: 255, stdout: output(READY), stderr: 'Killed by signal 15.' } })
+      .runner.run(ENV, [remove], { deadline: 100_000, signal: ctl.signal })
+    assert.deepEqual(aborted, UNKNOWN, 'aborted after spawning')
+    const overflow = await setup(() => ({ code: null, overflow: true, stdout: output(READY, BEGIN, marker('SEC', 'remove')) })).runner.run(ENV, [remove], OPTS)
+    assert.deepEqual(overflow, UNKNOWN, 'overflow')
   })
 
   test('an action keeps its answer when nothing could have been sent', async () => {

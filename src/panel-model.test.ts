@@ -4,7 +4,7 @@ import type { TreeItem } from 'orca'
 import {
   allowedActions, containerDetails, containerTree, defaultExpanded, dueForRefresh, hostOptions, imageTree, LOG_LINE_MAX, LOG_REFRESH_LOCAL_MS,
   LOG_REFRESH_REMOTE_MS, LOG_TEXT_MAX, logRefreshMs, logText, matchesFilter, networkTree, nextHost, problemCopy, refreshMs, rejectionProblem,
-  runningCount, stateIcon, volumeTree,
+  resourceDetails, resourceKindOf, runningCount, shownKey, stateIcon, volumeTree,
 } from './panel-model'
 
 const host = (id: HostInfo['id'], label: string, status: HostInfo['status']): HostInfo => ({ id, label, kind: id === 'local' ? 'local' : 'ssh', status })
@@ -331,4 +331,99 @@ test('runningCount and defaultExpanded', () => {
   assert.equal(runningCount(FIXTURE_CONTAINERS), 2)
   assert.deepEqual(defaultExpanded(FIXTURE_CONTAINERS).sort(), ['project:blog', 'project:shop'])
   assert.deepEqual(defaultExpanded([]), [])
+})
+
+const IMAGE_ID = `sha256:5f1e6a2b0c3d${'0'.repeat(52)}`
+const UNTAGGED_ID = `sha256:${'9'.repeat(64)}`
+const NET_ID = '7'.repeat(64)
+const RESOURCES = {
+  containers: FIXTURE_CONTAINERS,
+  images: [
+    // One image tagged `latest` in two repositories: both rows have the key `image:<id>:latest`, so the second gets `~2`.
+    { id: IMAGE_ID, repository: 'nginx', tag: 'latest', size: '192MB', createdSince: '2 weeks ago' },
+    { id: IMAGE_ID, repository: 'myreg/nginx', tag: 'latest', size: '192MB', createdSince: '2 weeks ago' },
+    { id: UNTAGGED_ID, repository: '<none>', tag: '<none>', size: '1.2GB', createdSince: '3 months ago' },
+    { id: UNTAGGED_ID, repository: 'app', tag: '<none>', size: '1.2GB', createdSince: '3 months ago' },
+  ],
+  volumes: [{ name: 'pgdata', driver: 'local' }],
+  networks: [
+    { id: NET_ID, name: 'ml_default', driver: 'bridge', scope: 'local' },
+    { id: 'a'.repeat(64), name: 'bridge', driver: 'bridge', scope: 'local' },
+    { id: 'b'.repeat(64), name: 'host', driver: 'host', scope: 'local' },
+    { id: 'c'.repeat(64), name: 'none', driver: 'null', scope: 'local' },
+  ],
+}
+
+test('resource keys name their kind; container ids and group rows name none', () => {
+  assert.equal(resourceKindOf(`image:${IMAGE_ID}:latest`), 'image')
+  assert.equal(resourceKindOf('volume:pgdata'), 'volume')
+  assert.equal(resourceKindOf(`network:${NET_ID}`), 'network')
+  for (const key of ['a'.repeat(64), 'project:shop', 'repo:nginx', 'images:x', '']) assert.equal(resourceKindOf(key), null, key)
+})
+
+test('an image tag card: repository:tag, its short id, size and age, Pull and Delete by that reference', () => {
+  assert.deepEqual(resourceDetails(RESOURCES, `image:${IMAGE_ID}:latest`), {
+    kind: 'image', key: `image:${IMAGE_ID}:latest`, title: 'nginx:latest',
+    items: [{ label: 'ID', value: '5f1e6a2b0c3d', code: true }, { label: 'Size', value: '192MB' }, { label: 'Created', value: '2 weeks ago' }],
+    removeRef: 'nginx:latest', removeBlocked: null, pullRef: 'nginx:latest',
+    removeText: 'The tag is removed, and the image too when no other tag uses it. This cannot be undone.',
+  })
+  // The same image under another repository: its `~2` row is pulled and deleted by its own reference.
+  const other = resourceDetails(RESOURCES, `image:${IMAGE_ID}:latest~2`)
+  assert.deepEqual([other?.title, other?.removeRef, other?.pullRef], ['myreg/nginx:latest', 'myreg/nginx:latest', 'myreg/nginx:latest'])
+})
+
+test('an image without a repository and tag is titled by its short id, has no Pull and deletes by id', () => {
+  const untagged = resourceDetails(RESOURCES, `image:${UNTAGGED_ID}:<none>`)
+  assert.deepEqual([untagged?.title, untagged?.pullRef, untagged?.removeRef, untagged?.removeText], [
+    '999999999999', null, UNTAGGED_ID, 'The image is removed from the host. This cannot be undone.',
+  ])
+  assert.deepEqual(untagged?.items[0], { label: 'ID', value: '999999999999', code: true })
+  // A repository without a tag: titled by both, but neither pulled nor deleted by that name.
+  const noTag = resourceDetails(RESOURCES, `image:${UNTAGGED_ID}:<none>~2`)
+  assert.deepEqual([noTag?.title, noTag?.pullRef, noTag?.removeRef], ['app:<none>', null, UNTAGGED_ID])
+})
+
+test('a volume card: its name and driver, deleted by name', () => {
+  assert.deepEqual(resourceDetails(RESOURCES, 'volume:pgdata'), {
+    kind: 'volume', key: 'volume:pgdata', title: 'pgdata', items: [{ label: 'Driver', value: 'local' }],
+    removeRef: 'pgdata', removeBlocked: null, pullRef: null,
+    removeText: 'The volume and its data are removed from the host. This cannot be undone.',
+  })
+})
+
+test('a network card: its name, driver, scope and short id, deleted by id; built-in networks cannot be deleted', () => {
+  assert.deepEqual(resourceDetails(RESOURCES, `network:${NET_ID}`), {
+    kind: 'network', key: `network:${NET_ID}`, title: 'ml_default',
+    items: [{ label: 'Driver', value: 'bridge' }, { label: 'Scope', value: 'local' }, { label: 'ID', value: '777777777777', code: true }],
+    removeRef: NET_ID, removeBlocked: null, pullRef: null, removeText: 'The network is removed from the host. This cannot be undone.',
+  })
+  for (const id of ['a', 'b', 'c']) {
+    const builtIn = resourceDetails(RESOURCES, `network:${id.repeat(64)}`)
+    assert.deepEqual([builtIn?.removeRef, builtIn?.removeBlocked], [id.repeat(64), "Docker's built-in networks cannot be deleted."], id)
+  }
+})
+
+test('no card for a key that is not an image, volume or network on this host', () => {
+  for (const key of ['a'.repeat(64), 'repo:nginx', 'project:shop', 'volume:gone', `network:${'d'.repeat(64)}`, `image:${IMAGE_ID}:stable`, '']) {
+    assert.equal(resourceDetails(RESOURCES, key), null, key)
+  }
+})
+
+test('shownKey: whether the trees draw an item for this filter', () => {
+  const shown = (filter: string, key: string) => shownKey(RESOURCES, filter, key)
+  // Containers: grouped or not.
+  assert.equal(shown('', 'a'.repeat(64)), true)
+  assert.equal(shown('zeta', 'c'.repeat(64)), true)
+  assert.equal(shown('zeta', 'a'.repeat(64)), false)
+  assert.equal(shown('', 'f'.repeat(64)), false)
+  // Images, volumes and networks.
+  assert.equal(shown('', `image:${IMAGE_ID}:latest~2`), true)
+  assert.equal(shown('nginx', `image:${IMAGE_ID}:latest`), true)
+  assert.equal(shown('pg', `image:${IMAGE_ID}:latest`), false)
+  assert.equal(shown('PG', 'volume:pgdata'), true)
+  assert.equal(shown('ml', 'volume:pgdata'), false)
+  assert.equal(shown('ml_', `network:${NET_ID}`), true)
+  assert.equal(shown('pg', `network:${NET_ID}`), false)
+  assert.equal(shown('', 'volume:gone'), false)
 })

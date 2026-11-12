@@ -4,8 +4,8 @@
   "execution": "trusted-worker",
   "id": "containers",
   "name": "Containers",
-  "version": "0.1.2",
-  "description": "Lists and manages containers on this Mac and on Linux SSH hosts from a sidebar panel, with logs in the panel and a shell in an Orca terminal.",
+  "version": "0.2.0",
+  "description": "Lists and manages containers, images, volumes and networks on this Mac and on Linux SSH hosts from a sidebar panel: logs in the panel, a shell and image pulls in an Orca terminal.",
   "icon": "assets/icon.png",
   "cover": { "path": "assets/cover.png", "alt": "The Containers icon and name beside two Containers panels, one light and one dark" },
   "screenshots": [

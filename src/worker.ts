@@ -5,7 +5,9 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { createHosts, type LocalWorkspace } from './hosts'
 import { createLocalRunner, nodeLocalDeps, type LocalRunner } from './local/runner'
 import { resolveOrcaCliPath } from './platform'
-import { WORK_BUDGET_MS, type ContainerAction, type FocusContext, type HostId, type Problem, type RunOptions, type TerminalKind } from './protocol'
+import {
+  WORK_BUDGET_MS, type ContainerAction, type FocusContext, type HostId, type Problem, type ResourceKind, type RunOptions, type TerminalKind,
+} from './protocol'
 import { createOrcaCli, nodeExec, type OrcaCli } from './remote/orca-cli'
 import { createSshRunner, nodeSshExec, type KeyValueStore, type SshExec } from './remote/ssh'
 import { createService, type Service } from './service'
@@ -25,6 +27,7 @@ const isHostId = (v: unknown): v is HostId => typeof v === 'string' && (v === 'l
 const isString = (v: unknown): v is string => typeof v === 'string'
 const isAction = (v: unknown): v is ContainerAction => v === 'start' || v === 'stop' || v === 'restart' || v === 'remove'
 const isKind = (v: unknown): v is TerminalKind => v === 'logs' || v === 'shell'
+const isResourceKind = (v: unknown): v is ResourceKind => v === 'image' || v === 'volume' || v === 'network'
 
 // Answers must be plain JSON: an undefined field would make the host refuse the answer.
 const plain = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
@@ -164,6 +167,24 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
       return { input: { hostId: o.hostId, kind: o.kind, containerId: o.containerId, containerName: o.containerName } }
     }, async (input, { service }, options) =>
       service.openTerminal(input.hostId, input.kind, input.containerId, input.containerName, await readFocus(), options))
+
+    // Only the shape here; the service checks `ref` against the kind's own rule.
+    register('docker.removeResource', (raw) => {
+      const o = obj(raw)
+      if (!o) return { error: NOT_OBJECT }
+      if (!isHostId(o.hostId)) return { error: BAD_HOST }
+      if (!isResourceKind(o.kind)) return { error: 'kind must be image, volume or network.' }
+      return isString(o.ref) ? { input: { hostId: o.hostId, kind: o.kind, ref: o.ref } } : { error: 'ref must be a string.' }
+    }, async (input, { service }, options) =>
+      service.removeResource(input.hostId, input.kind, input.ref, options))
+
+    register('docker.pullTerminal', (raw) => {
+      const o = obj(raw)
+      if (!o) return { error: NOT_OBJECT }
+      if (!isHostId(o.hostId)) return { error: BAD_HOST }
+      return isString(o.ref) ? { input: { hostId: o.hostId, ref: o.ref } } : { error: 'ref must be a string.' }
+    }, async (input, { service }, options) =>
+      service.pullTerminal(input.hostId, input.ref, await readFocus(), options))
   }
 
   // Nothing to close (no terminal is kept open): the requests still running are stopped, and new ones answer timeout.

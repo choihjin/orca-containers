@@ -1,9 +1,9 @@
-import type { ContainerAction, FocusContext, HostId, Opened, Problem, Result, RunOptions, Snapshot, TerminalKind } from './protocol'
+import type { ContainerAction, FocusContext, HostId, Opened, Problem, ResourceKind, Result, RunOptions, Snapshot, TerminalKind } from './protocol'
 import type { Anchor, Hosts, NoAnchor } from './hosts'
 import type { LocalRunner } from './local/runner'
 import { CliError, type OrcaCli } from './remote/orca-cli'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
-import { actionCommand, InvalidInputError, logsCommand, SNAPSHOT_COMMANDS, terminalArgv, type DockerCommand } from './docker/commands'
+import { actionCommand, InvalidInputError, logsCommand, pullArgv, removeCommand, SNAPSHOT_COMMANDS, terminalArgv, type DockerCommand } from './docker/commands'
 import { buildSnapshot, classifyFailure, cleanLabel, type CommandResult } from './docker/parse'
 import { isSupportedRemoteKernel, shellCommand } from './platform'
 
@@ -19,9 +19,11 @@ export type Service = {
   action(hostId: HostId, action: ContainerAction, containerId: string, options: RunOptions): Promise<Result<{ done: true }>>
   logs(hostId: HostId, containerId: string, options: RunOptions): Promise<Result<{ lines: string[]; takenAt: number }>>
   openTerminal(hostId: HostId, kind: TerminalKind, containerId: string, containerName: string, focus: FocusContext | null, options: RunOptions): Promise<Result<Opened>>
+  removeResource(hostId: HostId, kind: ResourceKind, ref: string, options: RunOptions): Promise<Result<{ done: true }>>
+  pullTerminal(hostId: HostId, ref: string, focus: FocusContext | null, options: RunOptions): Promise<Result<Opened>>
 }
 
-export function terminalTitle(kind: TerminalKind, name: string): string {
+export function terminalTitle(kind: TerminalKind | 'pull', name: string): string {
   return `${kind}: ${cleanLabel(name, 40)}`
 }
 
@@ -74,7 +76,7 @@ export function createService(deps: ServiceDeps): Service {
   }
 
   // Runs on the host's own runner: docker on this Mac, or `ssh <host name>` from this Mac. Neither needs a workspace or
-  // a terminal; only Logs/Shell terminals look up an anchor.
+  // a terminal; only Logs/Shell/Pull terminals look up an anchor.
   async function runCommands(hostId: HostId, commands: readonly DockerCommand[], options: RunOptions): Promise<Result<CommandResult[]>> {
     const env = envOf(hostId)
     return env === null ? { ok: true, value: await local.run(commands, options) } : ssh.run(env, commands, options)
@@ -106,6 +108,64 @@ export function createService(deps: ServiceDeps): Service {
     }
   }
 
+  // An action or a remove: the host must be ready, the command is built (and checked: a bad value runs nothing), then
+  // one run. Code 0 is done; anything else, or no result, is classified.
+  async function runDone(hostId: HostId, build: () => DockerCommand, options: RunOptions): Promise<Result<{ done: true }>> {
+    const host = await readyHost(hostId)
+    if (!host.ok) return host
+    let command: DockerCommand
+    try {
+      command = build()
+    } catch (error) {
+      if (error instanceof InvalidInputError) return fail('invalid', error.message)
+      throw error
+    }
+    const ran = await runCommands(hostId, [command], options)
+    if (!ran.ok) return ran
+    const { name } = command
+    const result = ran.value.find((r) => r.name === name) ?? { name, code: 1, lines: [`${name} produced no result`] }
+    return result.code === 0 ? { ok: true, value: { done: true } } : { ok: false, problem: classifyFailure(result) }
+  }
+
+  // Shell, Logs and Pull: one docker command in a new terminal on the host's anchor workspace. The host must be ready
+  // and have an anchor; `argv` is built (and checked) next, so a bad value opens and runs nothing; an SSH host must
+  // then be known to run Linux. The terminal comes to the front.
+  async function openCommandTerminal(
+    hostId: HostId, title: string, argv: () => string[], focus: FocusContext | null, options: RunOptions,
+  ): Promise<Result<Opened>> {
+    const host = await readyHost(hostId)
+    if (!host.ok) return host
+    const resolved = await anchorOf(hostId, focus)
+    if (!resolved.ok) return resolved
+    const anchor = resolved.value
+    let command: string
+    try {
+      command = shellCommand(argv())
+    } catch (error) {
+      if (error instanceof InvalidInputError) return fail('invalid', error.message)
+      throw error
+    }
+    const env = envOf(hostId)
+    if (env === null) {
+      if (anchor.workspaceId === undefined) return fail('no-workspace', MESSAGE['no-workspace'])
+      const terminalId = await deps.openLocalTerminal({ workspaceId: anchor.workspaceId, title, command })
+      await bringToFront({ handle: terminalId })
+      return { ok: true, value: { opened: true, workspace: anchor.name ?? baseName(anchor.path) } }
+    }
+    const linux = await linuxKnown(env, options)
+    if (!linux.ok) return linux
+    let handle: string
+    try {
+      handle = await cli.createTerminal({ environment: env, worktreePath: anchor.path, title, command, focus: true })
+    } catch (error) {
+      if (error instanceof CliError) return fail('unreachable', error.message)
+      throw error
+    }
+    await hosts.remember(hostId, anchor.path)
+    await bringToFront({ environment: env, handle })
+    return { ok: true, value: { opened: true, workspace: baseName(anchor.path) } }
+  }
+
   return {
     async snapshot(hostId, options) {
       const host = await readyHost(hostId)
@@ -115,19 +175,7 @@ export function createService(deps: ServiceDeps): Service {
     },
 
     async action(hostId, action, containerId, options) {
-      const host = await readyHost(hostId)
-      if (!host.ok) return host
-      let command: DockerCommand
-      try {
-        command = actionCommand(action, containerId)
-      } catch (error) {
-        if (error instanceof InvalidInputError) return fail('invalid', error.message)
-        throw error
-      }
-      const ran = await runCommands(hostId, [command], options)
-      if (!ran.ok) return ran
-      const result = ran.value.find((r) => r.name === 'action') ?? { name: 'action', code: 1, lines: ['action produced no result'] }
-      return result.code === 0 ? { ok: true, value: { done: true } } : { ok: false, problem: classifyFailure(result) }
+      return runDone(hostId, () => actionCommand(action, containerId), options)
     },
 
     async logs(hostId, containerId, options) {
@@ -148,38 +196,15 @@ export function createService(deps: ServiceDeps): Service {
     },
 
     async openTerminal(hostId, kind, containerId, containerName, focus, options) {
-      const host = await readyHost(hostId)
-      if (!host.ok) return host
-      const resolved = await anchorOf(hostId, focus)
-      if (!resolved.ok) return resolved
-      const anchor = resolved.value
-      let command: string
-      try {
-        command = shellCommand(terminalArgv(kind, containerId))
-      } catch (error) {
-        if (error instanceof InvalidInputError) return fail('invalid', error.message)
-        throw error
-      }
-      const title = terminalTitle(kind, containerName)
-      const env = envOf(hostId)
-      if (env === null) {
-        if (anchor.workspaceId === undefined) return fail('no-workspace', MESSAGE['no-workspace'])
-        const terminalId = await deps.openLocalTerminal({ workspaceId: anchor.workspaceId, title, command })
-        await bringToFront({ handle: terminalId })
-        return { ok: true, value: { opened: true, workspace: anchor.name ?? baseName(anchor.path) } }
-      }
-      const linux = await linuxKnown(env, options)
-      if (!linux.ok) return linux
-      let handle: string
-      try {
-        handle = await cli.createTerminal({ environment: env, worktreePath: anchor.path, title, command, focus: true })
-      } catch (error) {
-        if (error instanceof CliError) return fail('unreachable', error.message)
-        throw error
-      }
-      await hosts.remember(hostId, anchor.path)
-      await bringToFront({ environment: env, handle })
-      return { ok: true, value: { opened: true, workspace: baseName(anchor.path) } }
+      return openCommandTerminal(hostId, terminalTitle(kind, containerName), () => terminalArgv(kind, containerId), focus, options)
+    },
+
+    async removeResource(hostId, kind, ref, options) {
+      return runDone(hostId, () => removeCommand(kind, ref), options)
+    },
+
+    async pullTerminal(hostId, ref, focus, options) {
+      return openCommandTerminal(hostId, terminalTitle('pull', ref), () => pullArgv(ref), focus, options)
     },
   }
 }

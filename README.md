@@ -3,9 +3,9 @@
 ![Containers panels for this Mac and an SSH host](assets/cover.png)
 
 See and manage Docker containers from an [Orca](https://github.com/stablyai/orca) sidebar panel, on
-this Mac and on your Linux SSH hosts. Pick a host, see its containers, images, volumes and networks (images,
-volumes and networks are listed read-only), and start, stop, restart, read logs, open a shell or
-delete a container.
+this Mac and on your Linux SSH hosts. Pick a host and see its containers, images, volumes and networks.
+Start, stop, restart, read logs, open a shell or delete a container; delete images, volumes and networks;
+and pull images in an Orca terminal.
 
 [한국어](README.ko.md)
 
@@ -27,6 +27,17 @@ delete a container.
   confirmation and is disabled for running containers. Enter or a double-click on a container opens its
   logs. Shell opens a terminal on that host and Orca tries to bring that terminal to the front. A click on a Compose
   project row expands or collapses it.
+- **Images, volumes and networks:** selecting an image tag, a volume or a network shows a card with its
+  details and a Delete button, which asks for confirmation. Delete is never forced, so Docker refuses to
+  delete what is in use (for example a volume a container uses, or a network with containers connected),
+  and the card shows Docker's message. An image tag is deleted by its name (Docker removes the image too
+  when no other tag uses it), an image without a repository or tag by its ID. The built-in networks
+  `bridge`, `host` and `none` cannot be deleted. A click on a repository row in Images expands or
+  collapses it.
+- **Pull images:** **Pull** on an image tag's card, or a name typed into the Images section (for example
+  `nginx:latest`), runs `docker pull` in an Orca terminal on that host, the same way Shell does, so a large
+  pull is not bound by the panel's request time limit. The panel refuses a name that is not an image
+  reference before anything runs.
 - **Logs in the panel:** Logs shows the container's last 200 log lines under its card, without colour
   codes, and refreshes them while the panel is visible: every 3 s for this Mac, every 10 s for SSH hosts.
   Picking another container switches the logs to it. **Open in terminal** follows the logs live in an Orca
@@ -45,8 +56,9 @@ delete a container.
   `ssh -o BatchMode=yes <host name> true` in a terminal on this Mac: it must finish without an error.
   The host name must be made of ASCII letters, digits, `.`, `_` and `-`, and start with a letter or digit; other
   names cannot be used with ssh.
-- Listing, actions and the logs in the panel need only that ssh login. Shell and **Open in terminal** on an SSH
-  host also need a workspace on that host in Orca, and Orca's own connection to that host.
+- Listing, actions (deleting included) and the logs in the panel need only that ssh login. Shell, **Open in
+  terminal** and Pull on an SSH host also need a workspace on that host in Orca, and Orca's own connection to
+  that host.
 
 ## Install
 
@@ -54,10 +66,10 @@ In Orca, open **Settings → Plugins**, choose **Add plugin → From a Git URL�
 URL with a version tag and install:
 
 ```text
-https://github.com/choihjin/orca-containers#v0.1.2
+https://github.com/choihjin/orca-containers#v0.2.0
 ```
 
-Or from a terminal: `orca plugin install choihjin/orca-containers@v0.1.2`.
+Or from a terminal: `orca plugin install choihjin/orca-containers@v0.2.0`.
 
 Orca shows what the plugin asks for before it runs anything. Review it, then enable it.
 
@@ -68,13 +80,14 @@ Orca shows what the plugin asks for before it runs anything. Review it, then ena
   `/usr/bin`, the worker runs `/bin/zsh -lc 'command -v docker'`, which runs your zsh login startup files
   (`~/.zshenv`, `~/.zprofile`, `~/.zlogin`); a path it finds is reused, and while none is found this
   repeats on each refresh.
-- **SSH hosts:** listing, actions and the logs in the panel run `ssh <host name>` from this Mac, with the
-  Orca host name as the ssh destination, and send a fixed script to `sh` on that host. They open no
-  terminal and need only ssh: whether Orca can reach the host or has a workspace there does not matter.
+- **SSH hosts:** listing, actions (deleting included) and the logs in the panel run `ssh <host name>`
+  from this Mac, with the Orca host name as the ssh destination, and send a fixed script to `sh` on that
+  host. They open no terminal and need only ssh: whether Orca can reach the host or has a workspace there
+  does not matter.
   ssh runs with `BatchMode=yes`, so it never asks for a password or passphrase: a host it cannot
   log in to without a prompt shows "SSH connection failed" with what to fix. An ssh run that has not
   finished after 60 seconds is stopped.
-- **Terminals on SSH hosts:** only Shell and **Open in terminal** open a terminal. They use Orca's own
+- **Terminals on SSH hosts:** only Shell, **Open in terminal** and Pull open a terminal. They use Orca's own
   command-line tool (`orca … --environment <host>`) to open an Orca terminal in a workspace on that host, so
   they need a workspace on that host in Orca and Orca's own connection to it. Without them the panel says
   "Host unreachable" (Orca cannot reach the host) or "No workspace on this host".
@@ -85,13 +98,13 @@ Orca shows what the plugin asks for before it runs anything. Review it, then ena
 | --- | --- |
 | Runs its own code in a separate Node.js process with your user account's access to this machine (`trusted-worker`) | The worker has to run `docker`, `ssh` and the Orca command-line tool |
 | `workspace:read` | Read the focused workspace and the list of workspaces on this Mac, and hear when the focused workspace changes (for Follow focused workspace) |
-| `terminal:send` | Open the live logs (Open in terminal) and Shell terminals in a workspace on this Mac and run the fixed docker command there |
+| `terminal:send` | Open the live logs (Open in terminal), Shell and Pull terminals in a workspace on this Mac and run the fixed docker command there |
 | `storage:own` | Store data in the plugin's own storage folder |
 | `settings:own` | Read and change the plugin's own settings |
 
 Running `docker`, `ssh` and the Orca command-line tool from the worker does not appear separately in Orca's
-approval list. It falls under the `trusted-worker` access above. Terminals on SSH hosts (Shell and Open in
-terminal) go through the Orca command-line tool.
+approval list. It falls under the `trusted-worker` access above. Terminals on SSH hosts (Shell, Open in
+terminal and Pull) go through the Orca command-line tool.
 
 ## Limitations
 
@@ -100,13 +113,13 @@ terminal) go through the Orca command-line tool.
 - The log view cuts a line after 500 characters and shows only the newest lines that fit in 15,000
   characters. Open in terminal shows them whole.
 - If an SSH host's login shell startup files start tmux or screen automatically, the docker command of
-  Shell or Open in terminal may be typed into that program.
+  Shell, Open in terminal or Pull may be typed into that program.
 
 ## Not in v1
 
-Planned for later, each to be verified before work starts: Compose up/down; deleting images, volumes
-and networks, and pull; Orca on Linux or Windows; macOS SSH hosts; Orca older than 1.4.255; a Korean UI;
-detecting SSH hosts whose login shell starts tmux or screen automatically.
+Planned for later, each to be verified before work starts: Compose up/down; Orca on Linux or Windows;
+macOS SSH hosts; Orca older than 1.4.255; a Korean UI; detecting SSH hosts whose login shell starts tmux or
+screen automatically.
 
 ## Development
 

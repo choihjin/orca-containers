@@ -3,7 +3,10 @@ import { afterEach, assert, mockHost, mount, test, type TestPanel } from 'orca/t
 import scenarios from './panel.check.ts'
 import * as panel from './panel'
 
-const REQUEST_NAMES = ['docker.action', 'docker.logs', 'docker.openTerminal', 'docker.snapshot', 'hosts.list', 'hosts.matchFocus']
+const REQUEST_NAMES = [
+  'docker.action', 'docker.logs', 'docker.openTerminal', 'docker.pullTerminal', 'docker.removeResource', 'docker.snapshot', 'hosts.list',
+  'hosts.matchFocus',
+]
 
 let view: TestPanel | undefined
 afterEach(async () => {
@@ -11,7 +14,7 @@ afterEach(async () => {
   view = undefined
 })
 
-test('every check scenario stubs exactly the six worker requests', () => {
+test('every check scenario stubs exactly the eight worker requests', () => {
   assert.deepEqual(Object.keys(scenarios).sort(), ['daemonDown', 'empty', 'local', 'resources', 'ssh', 'sshFailed'])
   for (const [name, scenario] of Object.entries(scenarios)) {
     const stubs = scenario.requests ?? {}

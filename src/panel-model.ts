@@ -1,5 +1,7 @@
 import type { IconName, KeyValueItem, TreeItem } from 'orca'
-import type { ContainerRow, ContainerState, HostId, HostInfo, ImageRow, NetworkRow, Problem, ProblemKind, VolumeRow } from './protocol'
+import type {
+  ContainerRow, ContainerState, HostId, HostInfo, ImageRow, NetworkRow, Problem, ProblemKind, ResourceKind, Snapshot, VolumeRow,
+} from './protocol'
 
 export type Allowed = { start: boolean; stop: boolean; restart: boolean; logs: boolean; shell: boolean; remove: boolean }
 
@@ -192,8 +194,12 @@ export function containerTree(rows: readonly ContainerRow[], filter: string): Tr
   return out
 }
 
+const imageKey = (row: ImageRow) => `image:${row.id}:${row.tag}`
+const volumeKey = (row: VolumeRow) => `volume:${row.name}`
+const networkKey = (row: NetworkRow) => `network:${row.id}`
+
 export function imageTree(rows: readonly ImageRow[], filter: string): TreeItem[] {
-  const keyed = withUniqueKeys(rows, (row) => `image:${row.id}:${row.tag}`)
+  const keyed = withUniqueKeys(rows, imageKey)
   const groups = new Map<string, typeof keyed>()
   for (const k of keyed) {
     const g = groups.get(k.row.repository)
@@ -214,13 +220,97 @@ export function imageTree(rows: readonly ImageRow[], filter: string): TreeItem[]
 }
 
 export function volumeTree(rows: readonly VolumeRow[], filter: string): TreeItem[] {
-  return withUniqueKeys(rows, (r) => `volume:${r.name}`).filter(({ row: r }) => matchesFilter(filter, r.name, r.driver))
+  return withUniqueKeys(rows, volumeKey).filter(({ row: r }) => matchesFilter(filter, r.name, r.driver))
     .map(({ row: r, key }) => ({ key, label: r.name, description: r.driver, icon: 'database' as const }))
 }
 
 export function networkTree(rows: readonly NetworkRow[], filter: string): TreeItem[] {
-  return withUniqueKeys(rows, (r) => `network:${r.id}`).filter(({ row: r }) => matchesFilter(filter, r.name, r.driver, r.scope))
+  return withUniqueKeys(rows, networkKey).filter(({ row: r }) => matchesFilter(filter, r.name, r.driver, r.scope))
     .map(({ row: r, key }) => ({ key, label: r.name, description: `${r.driver} · ${r.scope}`, icon: 'globe' as const }))
+}
+
+// The kind of item a tree key names: image tag, volume and network rows. Container ids and group rows name none.
+export function resourceKindOf(key: string): ResourceKind | null {
+  if (key.startsWith('image:')) return 'image'
+  if (key.startsWith('volume:')) return 'volume'
+  if (key.startsWith('network:')) return 'network'
+  return null
+}
+
+type Lists = Pick<Snapshot, 'containers' | 'images' | 'volumes' | 'networks'>
+
+// Whether the trees draw the item with this key for this filter.
+export function shownKey(lists: Lists, filter: string, key: string): boolean {
+  const kind = resourceKindOf(key)
+  const items = kind === 'image' ? imageTree(lists.images, filter)
+    : kind === 'volume' ? volumeTree(lists.volumes, filter)
+    : kind === 'network' ? networkTree(lists.networks, filter)
+    : containerTree(lists.containers, filter)
+  return items.some((item) => item.key === key || item.children?.some((child) => child.key === key) === true)
+}
+
+// The card of a selected image tag, volume or network.
+export type ResourceDetails = {
+  kind: ResourceKind
+  key: string
+  title: string
+  items: KeyValueItem[]
+  // Delete sends this as `ref`.
+  removeRef: string
+  // Why Delete is disabled (a built-in network); null when it is not.
+  removeBlocked: string | null
+  // What the delete question says will happen.
+  removeText: string
+  // Pull sends this; null for an image without a repository or tag.
+  pullRef: string | null
+}
+
+const NONE = '<none>'
+// Docker creates these itself and refuses to remove them.
+const BUILT_IN_NETWORKS: readonly string[] = ['bridge', 'host', 'none']
+const shortId = (id: string) => id.replace(/^sha256:/, '').slice(0, 12)
+const removedFromHost = (subject: string) => `${subject} removed from the host. This cannot be undone.`
+
+function rowAt<T>(rows: readonly T[], keyOf: (row: T) => string, key: string): T | null {
+  return withUniqueKeys(rows, keyOf).find((k) => k.key === key)?.row ?? null
+}
+
+function imageDetails(row: ImageRow, key: string): ResourceDetails {
+  const tagged = row.repository !== NONE && row.tag !== NONE
+  const ref = `${row.repository}:${row.tag}`
+  return {
+    kind: 'image', key, title: row.repository === NONE ? shortId(row.id) : ref,
+    items: [{ label: 'ID', value: shortId(row.id), code: true }, { label: 'Size', value: row.size }, { label: 'Created', value: row.createdSince }],
+    removeRef: tagged ? ref : row.id, removeBlocked: null, pullRef: tagged ? ref : null,
+    removeText: tagged ? 'The tag is removed, and the image too when no other tag uses it. This cannot be undone.' : removedFromHost('The image is'),
+  }
+}
+
+export function resourceDetails(lists: Omit<Lists, 'containers'>, key: string): ResourceDetails | null {
+  const kind = resourceKindOf(key)
+  if (kind === 'image') {
+    const row = rowAt(lists.images, imageKey, key)
+    return row === null ? null : imageDetails(row, key)
+  }
+  if (kind === 'volume') {
+    const row = rowAt(lists.volumes, volumeKey, key)
+    if (row === null) return null
+    return {
+      kind, key, title: row.name, items: [{ label: 'Driver', value: row.driver }],
+      removeRef: row.name, removeBlocked: null, removeText: removedFromHost('The volume and its data are'), pullRef: null,
+    }
+  }
+  if (kind === 'network') {
+    const row = rowAt(lists.networks, networkKey, key)
+    if (row === null) return null
+    return {
+      kind, key, title: row.name,
+      items: [{ label: 'Driver', value: row.driver }, { label: 'Scope', value: row.scope }, { label: 'ID', value: shortId(row.id), code: true }],
+      removeRef: row.id, removeBlocked: BUILT_IN_NETWORKS.includes(row.name) ? "Docker's built-in networks cannot be deleted." : null,
+      removeText: removedFromHost('The network is'), pullRef: null,
+    }
+  }
+  return null
 }
 
 function statusItem(row: ContainerRow): KeyValueItem {

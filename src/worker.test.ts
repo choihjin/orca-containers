@@ -37,13 +37,14 @@ type ExecCall = { file: string; args: string[]; input: string; timeoutMs: number
 
 function setup(results: Record<string, unknown> = {}, cliSetup?: (cli: FakeCli) => void) {
   const counts = { cli: 0, local: 0, sshExec: 0 }
-  const runs: { deadline: number; hasSignal: boolean }[] = []
+  const runs: { deadline: number; hasSignal: boolean; argv: string[][] }[] = []
   const cli = new FakeCli()
   cliSetup?.(cli)
   const local: LocalRunner = {
     async run(commands, options) {
-      runs.push({ deadline: options.deadline, hasSignal: options.signal instanceof AbortSignal })
+      runs.push({ deadline: options.deadline, hasSignal: options.signal instanceof AbortSignal, argv: commands.map((c) => c.argv) })
       if (commands.some((c) => c.name === 'logs')) return [{ name: 'logs', code: 0, lines: ['l1', 'l2'] }]
+      if (commands.some((c) => c.name === 'remove')) return [{ name: 'remove', code: 0, lines: [] }]
       return commands.some((c) => c.name === 'action') ? [{ name: 'action', code: 0, lines: [] }] : okResults()
     },
   }
@@ -270,6 +271,20 @@ test('rejects invalid input before calling the service', async () => {
     ['docker.logs', { hostId: 'local', containerId: 5 }],
     ['docker.action', { hostId: 'local', action: 'kill', containerId: 'abc' }],
     ['docker.openTerminal', { hostId: 'local', kind: 'exec', containerId: 'a', containerName: 'b' }],
+    ['docker.removeResource', null],
+    ['docker.removeResource', ['local', 'image', 'nginx']],
+    ['docker.removeResource', { hostId: 'remote', kind: 'image', ref: 'nginx' }],
+    ['docker.removeResource', { hostId: 'local', kind: 'container', ref: 'nginx' }],
+    ['docker.removeResource', { hostId: 'local', kind: 'constructor', ref: 'nginx' }],
+    ['docker.removeResource', { hostId: 'local', ref: 'nginx' }],
+    ['docker.removeResource', { hostId: 'local', kind: 'image' }],
+    ['docker.removeResource', { hostId: 'local', kind: 'image', ref: 5 }],
+    ['docker.removeResource', { hostId: 'local', kind: 'volume', ref: ['pgdata'] }],
+    ['docker.pullTerminal', null],
+    ['docker.pullTerminal', { hostId: 'ssh:', ref: 'nginx' }],
+    ['docker.pullTerminal', { hostId: 'local' }],
+    ['docker.pullTerminal', { hostId: 'local', ref: null }],
+    ['docker.pullTerminal', { hostId: 'local', ref: { name: 'nginx' } }],
     ['hosts.list', { refresh: 'yes' }],
     ['hosts.matchFocus', { displayName: 1 }],
   ] as const) {
@@ -278,6 +293,85 @@ test('rejects invalid input before calling the service', async () => {
     assert.equal(r.problem.kind, 'invalid', name)
   }
   assert.equal(s.counts.cli, 0)
+})
+
+test('answers docker.removeResource with the exact shape, running the fixed command', async () => {
+  const s = setup()
+  const w = await mountWorker(s.module, { host: s.host })
+  const r = await w.request('docker.removeResource', { hostId: 'local', kind: 'image', ref: 'nginx:1.27' })
+  assert.deepEqual(r, { ok: true, value: { done: true } })
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), r)
+  assert.deepEqual(s.runs.map((run) => run.argv), [[['image', 'rm', 'nginx:1.27']]])
+  assert.equal(s.runs[0]?.deadline, 101_000)
+  assert.deepEqual(s.host.callsOf('workspace.readContext'), [])
+  assert.deepEqual(s.host.callsOf('terminal.create'), [])
+  assert.deepEqual(w.refusals, [])
+})
+
+test('an SSH remove reaches the injected ssh exec with the fixed command, and opens no terminal', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  const r = await w.request('docker.removeResource', { hostId: 'ssh:GPU1', kind: 'volume', ref: 'pgdata' })
+  assert.deepEqual(r, { ok: true, value: { done: true } })
+  assert.equal(s.execs.length, 1)
+  assert.deepEqual(s.execs[0]!.args.slice(-3), ['--', 'GPU1', 'sh -s'])
+  assert.ok(s.execs[0]!.input.includes('"$D" volume rm pgdata </dev/null'), s.execs[0]!.input)
+  assert.equal(s.cli.calls.some((c) => c.method === 'createTerminal'), false)
+  assert.deepEqual(s.host.callsOf('terminal.create'), [])
+  // The daemon refusing it comes back as its own message.
+  s.ssh.answer = async (call) => ({
+    code: 0, timedOut: false, stderr: '',
+    stdout: remoteOutput(call.input, { remove: { code: 1, lines: ['Error response from daemon: remove pgdata: volume is in use - [0123456789ab]'] } }),
+  })
+  assert.deepEqual(await w.request('docker.removeResource', { hostId: 'ssh:GPU1', kind: 'volume', ref: 'pgdata' }),
+    { ok: false, problem: { kind: 'failed', message: 'remove pgdata: volume is in use - [0123456789ab]' } })
+  assert.deepEqual(w.refusals, [])
+})
+
+test('a remove or pull with a hostile ref is invalid and runs or opens nothing', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  for (const ref of ['-f', '--force', 'nginx -f', 'a;b', '$(id)', 'a\nb', '../x', 'a@b@c']) {
+    for (const hostId of ['local', 'ssh:GPU1'] as const) {
+      for (const kind of ['image', 'volume', 'network'] as const) {
+        const r = await w.request('docker.removeResource', { hostId, kind, ref }) as { ok: boolean; problem: { kind: string } }
+        assert.equal(r.problem.kind, 'invalid', `${hostId} ${kind} ${JSON.stringify(ref)}`)
+      }
+      const pull = await w.request('docker.pullTerminal', { hostId, ref }) as { ok: boolean; problem: { kind: string } }
+      assert.equal(pull.problem.kind, 'invalid', `${hostId} pull ${JSON.stringify(ref)}`)
+    }
+  }
+  assert.equal(s.runs.length, 0)
+  assert.equal(s.execs.length, 0)
+  assert.deepEqual(s.host.callsOf('terminal.create'), [])
+  assert.equal(s.cli.calls.some((c) => c.method === 'createTerminal'), false)
+})
+
+test('answers docker.pullTerminal by opening a local terminal with docker pull and its title', async () => {
+  const s = setup()
+  const w = await mountWorker(s.module, { host: s.host })
+  const r = await w.request('docker.pullTerminal', { hostId: 'local', ref: 'nginx:latest' })
+  assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), r)
+  assert.deepEqual(s.host.callsOf('terminal.create'), [{ workspaceId: 'ws1', title: 'pull: nginx:latest', command: 'docker pull nginx:latest' }])
+  assert.equal(s.host.callsOf('workspace.readContext').length, 1)
+  assert.equal(s.runs.length, 0)
+  assert.deepEqual(w.refusals, [])
+})
+
+test('an SSH pull opens an Orca terminal on that host after the kernel check, and runs no docker command', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  const r = await w.request('docker.pullTerminal', { hostId: 'ssh:GPU1', ref: 'ghcr.io/org/app:1.2' })
+  assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
+  assert.equal(s.execs.length, 1)
+  assert.equal(s.execs[0]!.input.includes('SEC_'), false, s.execs[0]!.input)
+  const created = s.cli.calls.filter((c) => c.method === 'createTerminal')
+  assert.deepEqual(created, [{
+    method: 'createTerminal', environment: 'GPU1', worktreePath: '/home/u/proj', title: 'pull: ghcr.io/org/app:1.2',
+    command: 'docker pull ghcr.io/org/app:1.2', focus: true,
+  }])
+  assert.deepEqual(s.cli.calls.filter((c) => c.method === 'switchTo').map((c) => c.environment), ['GPU1'])
 })
 
 test('deactivate does not create the dependencies', async () => {
