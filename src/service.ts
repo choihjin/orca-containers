@@ -24,11 +24,17 @@ export type Service = {
   snapshot(hostId: HostId, options: RunOptions): Promise<Result<Snapshot>>
   action(hostId: HostId, action: ContainerAction, containerId: string, options: RunOptions): Promise<Result<{ done: true }>>
   logs(hostId: HostId, containerId: string, options: RunOptions): Promise<Result<{ lines: string[]; takenAt: number }>>
-  openTerminal(hostId: HostId, kind: TerminalKind, containerId: string, containerName: string, focus: FocusContext | null, options: RunOptions): Promise<Result<Opened>>
+  // allowStartupShell: open on an SSH host without reading its login startup files first (see checkTerminalHost).
+  openTerminal(
+    hostId: HostId, kind: TerminalKind, containerId: string, containerName: string, focus: FocusContext | null, options: RunOptions,
+    allowStartupShell?: boolean,
+  ): Promise<Result<Opened>>
   removeResource(hostId: HostId, kind: ResourceKind, ref: string, options: RunOptions): Promise<Result<{ done: true }>>
-  pullTerminal(hostId: HostId, ref: string, focus: FocusContext | null, options: RunOptions): Promise<Result<Opened>>
+  pullTerminal(hostId: HostId, ref: string, focus: FocusContext | null, options: RunOptions, allowStartupShell?: boolean): Promise<Result<Opened>>
   composeAction(hostId: HostId, project: string, memberId: string, action: ComposeAction, options: RunOptions): Promise<Result<{ done: true }>>
-  composeUp(hostId: HostId, project: string, memberId: string, focus: FocusContext | null, options: RunOptions): Promise<Result<Opened>>
+  composeUp(
+    hostId: HostId, project: string, memberId: string, focus: FocusContext | null, options: RunOptions, allowStartupShell?: boolean,
+  ): Promise<Result<Opened>>
 }
 
 export function terminalTitle(kind: TerminalKind | 'pull' | 'compose up', name: string): string {
@@ -122,25 +128,47 @@ export function createService(deps: ServiceDeps): Service {
     return env === null ? { ok: true, value: await local.run(commands, options) } : ssh.run(env, commands, options)
   }
 
-  // A terminal opens only on a host known to run a supported kernel (Linux or macOS). A stored kernel decides at once.
-  // With none stored, or a store that cannot be read, one ssh run with no docker command reads the kernel (the runner
-  // stores it, and answers unsupported for any other kernel).
-  // The answer carries the kernel when it can be read (after a check, from what the runner stored), else null.
-  async function kernelKnown(env: string, options: RunOptions): Promise<Result<{ kernel: string | null }>> {
-    const storedKernel = async (): Promise<string | null> => {
-      try {
-        const kernel = await deps.storage.get(kernelKey(env))
-        return typeof kernel === 'string' ? kernel : null
-      } catch {
-        return null
-      }
+  // The kernel the host last reported (the ssh runner stores it), or null: none stored, or a store that cannot be read.
+  async function storedKernel(env: string): Promise<string | null> {
+    try {
+      const kernel = await deps.storage.get(kernelKey(env))
+      return typeof kernel === 'string' ? kernel : null
+    } catch {
+      return null
     }
-    const kernel = await storedKernel()
-    if (kernel !== null) {
-      return isSupportedRemoteKernel(kernel) ? { ok: true, value: { kernel } } : fail('unsupported', MESSAGE.unsupported)
+  }
+
+  // A terminal opens only on a host known to run a supported kernel (Linux or macOS) and, when `scan` is true, whose
+  // login startup files do not seem to start tmux, screen or byobu: Orca types the command into whatever shell the host
+  // starts. A stored unsupported kernel answers at once. Otherwise one ssh run:
+  // - with `scan`, the startup scan, which also reads (and the runner stores) the kernel. Files found answer
+  //   startup-shell with their paths. A scan that fails answers its own problem when it says unsupported, when the
+  //   request ended meanwhile (aborted, or its work budget used up), or when no supported kernel is known: none was
+  //   stored before, and the run did not store one before it timed out or broke off (timeout, failed). Otherwise a scan
+  //   that fails or gives no answer does not stop the terminal; it is logged.
+  // - without, only when no kernel is stored: a run with no docker command reads it.
+  // The answer carries the kernel when it can be read (after a run, what the runner stored wins), else null.
+  async function checkTerminalHost(env: string, options: RunOptions, scan: boolean): Promise<Result<{ kernel: string | null }>> {
+    const kernel = await storedKernel(env)
+    if (kernel !== null && !isSupportedRemoteKernel(kernel)) return fail('unsupported', MESSAGE.unsupported)
+    if (!scan) {
+      if (kernel !== null) return { ok: true, value: { kernel } }
+      const checked = await ssh.run(env, [], options)
+      return checked.ok ? { ok: true, value: { kernel: await storedKernel(env) } } : checked
     }
-    const checked = await ssh.run(env, [], options)
-    return checked.ok ? { ok: true, value: { kernel: await storedKernel() } } : checked
+    const scanned = await ssh.startupScan(env, options)
+    if (!scanned.ok) {
+      const { kind, message } = scanned.problem
+      if (kind === 'unsupported' || options.signal?.aborted === true || deps.now() >= options.deadline) return scanned
+      if (kernel === null && kind !== 'timeout' && kind !== 'failed') return scanned
+      const latest = (await storedKernel(env)) ?? kernel
+      if (latest === null || !isSupportedRemoteKernel(latest)) return scanned
+      deps.log?.(`startup file scan on ${env} failed: ${message}`)
+      return { ok: true, value: { kernel: latest } }
+    }
+    if (scanned.value !== null && scanned.value.length > 0) return fail('startup-shell', scanned.value.join(', '))
+    if (scanned.value === null) deps.log?.(`startup file scan on ${env} failed: no answer`)
+    return { ok: true, value: { kernel: (await storedKernel(env)) ?? kernel } }
   }
 
   // Bringing the new terminal to the front is best effort: the terminal is open either way.
@@ -185,9 +213,11 @@ export function createService(deps: ServiceDeps): Service {
 
   // Shell, Logs, Pull and Compose up: one docker command in a new terminal on the host's anchor workspace. The host must
   // be ready and have an anchor; `command` is built (and checked) next, so a bad value opens and runs nothing; an SSH host
-  // must then be known to run Linux or macOS. Only then does Up look its argv up. The terminal comes to the front.
+  // must then be known to run Linux or macOS and, unless `allowStartupShell`, pass the startup scan (checkTerminalHost).
+  // Only then does Up look its argv up. The terminal comes to the front.
   async function openCommandTerminal(
     hostId: HostId, title: string, command: () => TerminalCommand, focus: FocusContext | null, options: RunOptions,
+    allowStartupShell: boolean,
   ): Promise<Result<Opened>> {
     const host = await readyHost(hostId)
     if (!host.ok) return host
@@ -205,7 +235,7 @@ export function createService(deps: ServiceDeps): Service {
       await bringToFront({ handle: terminalId })
       return { ok: true, value: { opened: true, workspace: anchor.name ?? baseName(anchor.path) } }
     }
-    const known = await kernelKnown(env, options)
+    const known = await checkTerminalHost(env, options, !allowStartupShell)
     if (!known.ok) return known
     const args = await argvOf(prepared.value)
     if (!args.ok) return args
@@ -253,16 +283,16 @@ export function createService(deps: ServiceDeps): Service {
       return { ok: true, value: { lines: answerLines(result.lines), takenAt: deps.now() } }
     },
 
-    async openTerminal(hostId, kind, containerId, containerName, focus, options) {
-      return openCommandTerminal(hostId, terminalTitle(kind, containerName), () => terminalArgv(kind, containerId), focus, options)
+    async openTerminal(hostId, kind, containerId, containerName, focus, options, allowStartupShell = false) {
+      return openCommandTerminal(hostId, terminalTitle(kind, containerName), () => terminalArgv(kind, containerId), focus, options, allowStartupShell)
     },
 
     async removeResource(hostId, kind, ref, options) {
       return runDone(hostId, () => removeCommand(kind, ref), options)
     },
 
-    async pullTerminal(hostId, ref, focus, options) {
-      return openCommandTerminal(hostId, terminalTitle('pull', ref), () => pullArgv(ref), focus, options)
+    async pullTerminal(hostId, ref, focus, options, allowStartupShell = false) {
+      return openCommandTerminal(hostId, terminalTitle('pull', ref), () => pullArgv(ref), focus, options, allowStartupShell)
     },
 
     // Start, stop, restart or down of the whole project: the labels lookup, then one compose command (55 s limit).
@@ -283,14 +313,14 @@ export function createService(deps: ServiceDeps): Service {
     },
 
     // `docker compose ... up -d` in a terminal, as Pull opens one; the labels lookup runs once the terminal can open.
-    async composeUp(hostId, project, memberId, focus, options) {
+    async composeUp(hostId, project, memberId, focus, options, allowStartupShell = false) {
       return openCommandTerminal(hostId, terminalTitle('compose up', project), () => {
         const lookup = composeLookup(project, memberId)
         return async () => {
           const target = await composeTargetOf(hostId, project, lookup, options)
           return target.ok ? checked(() => composeUpArgv(target.value)) : target
         }
-      }, focus, options)
+      }, focus, options, allowStartupShell)
     },
   }
 }

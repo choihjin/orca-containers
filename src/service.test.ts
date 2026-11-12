@@ -1,5 +1,5 @@
 import { assert, describe, test } from 'orca/testing'
-import type { ComposeAction, ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Problem, ResourceKind, Result } from './protocol'
+import type { ComposeAction, ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Opened, Problem, ResourceKind, Result } from './protocol'
 import { createHosts, type Anchor, type Hosts, type NoAnchor } from './hosts'
 import { createLocalRunner, type LocalRunner } from './local/runner'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
@@ -12,7 +12,8 @@ import type { CommandResult } from './docker/parse'
 import { createService, terminalTitle } from './service'
 
 const ID = 'a'.repeat(12)
-const OPTIONS = { deadline: 1_000 }
+// After the setups' clock (4242): the work budget is not used up.
+const OPTIONS = { deadline: 10_000 }
 const FOCUS: FocusContext = { displayName: 'main', branch: 'main', terminalIds: [] }
 
 // One member container of Compose project `shop`, and the labels docker inspect gives for it.
@@ -43,6 +44,7 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
   const log = {
     localRuns: [] as { commands: readonly DockerCommand[]; options: unknown }[],
     sshRuns: [] as { env: string; commands: readonly DockerCommand[]; options: unknown }[],
+    scans: [] as { env: string; options: unknown }[], // startup file scans
     created: [] as { environment: string; worktreePath: string; title: string; command: string; focus?: boolean }[],
     switched: [] as { environment?: string; handle: string }[],
     logs: [] as string[],
@@ -54,6 +56,8 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
   // A fixed answer, or one built from the commands of each run.
   let localResults: CommandResult[] | ((commands: readonly DockerCommand[]) => CommandResult[]) = okResults()
   let sshResult: Result<CommandResult[]> | ((commands: readonly DockerCommand[]) => Result<CommandResult[]>) = { ok: true, value: okResults() }
+  // The startup scan finds nothing unless a test says otherwise.
+  let scanResult: Result<string[] | null> | (() => Result<string[] | null>) = { ok: true, value: [] }
   let createError: Error | null = null
   let switchError: Error | null = null
   const status = opts.status ?? 'ready'
@@ -93,6 +97,11 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
       if (checkKernel !== null) stored.set(kernelKey(env), checkKernel)
       return typeof sshResult === 'function' ? sshResult(commands) : sshResult
     },
+    async startupScan(env, options) {
+      calls.push('ssh.scan'); log.order.push('ssh.scan'); log.scans.push({ env, options })
+      if (checkKernel !== null) stored.set(kernelKey(env), checkKernel)
+      return typeof scanResult === 'function' ? scanResult() : scanResult
+    },
   }
   const cli = {
     async createTerminal(o: { environment: string; worktreePath: string; title: string; command: string; focus?: boolean }) {
@@ -115,6 +124,7 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
     service, calls, log,
     setLocal(r: CommandResult[] | ((commands: readonly DockerCommand[]) => CommandResult[])) { localResults = r },
     setSsh(r: Result<CommandResult[]> | ((commands: readonly DockerCommand[]) => Result<CommandResult[]>)) { sshResult = r },
+    setScan(r: Result<string[] | null> | (() => Result<string[] | null>)) { scanResult = r },
     failCreate(e: Error) { createError = e },
     failSwitch(e: Error) { switchError = e },
     failStorageRead() { storageFails = true },
@@ -147,6 +157,7 @@ function noTerminalSetup() {
       const single = ['action', 'logs', 'remove', 'labels', 'compose'].find((name) => names.includes(name as DockerCommand['name']))
       return { ok: true, value: answers[single ?? 'snapshot']! }
     },
+    startupScan: refuse('ssh.startupScan'),
   }
   const local: LocalRunner = { async run() { used.push('local.run'); return [] } }
   const storage: KeyValueStore = { get: refuse('storage.get'), set: refuse('storage.set'), delete: refuse('storage.delete') }
@@ -372,7 +383,7 @@ describe('service', () => {
     assert.deepEqual(down.calls, [])
   })
 
-  test('opens remote logs in a focused terminal on the anchor workspace, remembers it and switches to it, with no ssh run', async () => {
+  test('opens remote logs in a focused terminal on the anchor workspace, remembers it and switches to it, after the startup scan', async () => {
     const t = setup({ anchor: { path: '/home/me/main' } })
     const r = await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS)
     assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'main' } }) // ruling I2: the path's basename
@@ -381,16 +392,18 @@ describe('service', () => {
     }])
     assert.deepEqual(t.log.remembered, [{ hostId: 'ssh:A', path: '/home/me/main' }])
     assert.deepEqual(t.log.switched, [{ environment: 'A', handle: 'term_1' }])
-    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.scan', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.scans, [{ env: 'A', options: OPTIONS }])
     assert.deepEqual(t.log.sshRuns, [])
   })
 
-  test('an SSH terminal on a host whose kernel is not known yet checks it with one empty ssh run first', async () => {
+  test('an SSH terminal on a host whose kernel is not known yet checks it with the startup scan run first', async () => {
     const t = setup({ kernel: null, anchor: { path: '/home/me/main' } })
     const r = await t.service.openTerminal('ssh:A', 'shell', ID, 'web', FOCUS, OPTIONS)
     assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'main' } })
-    assert.deepEqual(t.log.sshRuns, [{ env: 'A', commands: [], options: OPTIONS }])
-    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.scans, [{ env: 'A', options: OPTIONS }])
+    assert.deepEqual(t.log.sshRuns, [])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.scan', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
   })
 
   test('a failing kernel check answers its own problem and opens no terminal', async () => {
@@ -401,21 +414,24 @@ describe('service', () => {
     ]
     for (const problem of problems) {
       const t = setup({ kernel: null })
-      t.setSsh({ ok: false, problem })
+      t.setScan({ ok: false, problem })
       assert.deepEqual(await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS), { ok: false, problem })
-      assert.equal(t.log.sshRuns.length, 1)
+      assert.equal(t.log.scans.length, 1)
+      assert.equal(t.log.sshRuns.length, 0)
       assert.deepEqual(t.log.created, [])
       assert.deepEqual(t.log.remembered, [])
       assert.deepEqual(t.log.switched, [])
     }
   })
 
-  test('a stored Linux kernel opens the SSH terminal without an ssh run; a local terminal never checks one', async () => {
+  test('a stored Linux kernel opens the SSH terminal without a kernel check run; a local terminal never checks one', async () => {
     const t = setup({ kernel: 'Linux' })
     assert.equal((await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, true)
     assert.equal((await t.service.openTerminal('local', 'shell', ID, 'web', FOCUS, OPTIONS)).ok, true)
     assert.deepEqual(t.log.sshRuns, [])
-    assert.equal(t.log.order.filter((step) => step.startsWith('storage.get')).length, 1)
+    assert.equal(t.log.scans.length, 1)
+    // The SSH terminal reads the kernel before and after its scan; the local one never.
+    assert.equal(t.log.order.filter((step) => step.startsWith('storage.get')).length, 2)
   })
 
   test('a stored Linux kernel types the plain docker command', async () => {
@@ -426,7 +442,7 @@ describe('service', () => {
 
   // A Mac host's terminal shell may not be a login shell, so /usr/local/bin may be missing from its PATH: the command
   // looks docker up the way the ssh script does.
-  test('a stored Darwin kernel opens the SSH terminal without an ssh run, with the macOS docker lookup', async () => {
+  test('a stored Darwin kernel opens the SSH terminal without a kernel check run, with the macOS docker lookup', async () => {
     const t = setup({ kernel: 'Darwin' })
     assert.equal((await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, true)
     assert.equal((await t.service.pullTerminal('ssh:A', 'nginx:1.27', null, OPTIONS)).ok, true)
@@ -463,6 +479,7 @@ describe('service', () => {
     assert.deepEqual(await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS),
       { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } })
     assert.deepEqual(t.log.sshRuns, [])
+    assert.deepEqual(t.log.scans, [])
     assert.deepEqual(t.log.created, [])
     assert.deepEqual(t.log.remembered, [])
   })
@@ -471,7 +488,8 @@ describe('service', () => {
     const t = setup({ kernel: 'Linux' })
     t.failStorageRead()
     assert.equal((await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, true)
-    assert.deepEqual(t.log.sshRuns.map((r) => r.commands), [[]])
+    assert.equal(t.log.scans.length, 1)
+    assert.deepEqual(t.log.sshRuns, [])
     assert.equal(t.log.created.length, 1)
   })
 
@@ -480,7 +498,7 @@ describe('service', () => {
     assert.equal((await bad.service.openTerminal('ssh:A', 'shell', '$(id)', 'web', null, OPTIONS)).ok, false)
     const noAnchor = setup({ kernel: null, anchor: { missing: 'no-workspace' } })
     assert.equal((await noAnchor.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, false)
-    assert.deepEqual([...bad.log.sshRuns, ...noAnchor.log.sshRuns], [])
+    assert.deepEqual([...bad.log.sshRuns, ...noAnchor.log.sshRuns, ...bad.log.scans, ...noAnchor.log.scans], [])
   })
 
   test('remote Logs/Shell switch Orca to the created terminal', async () => {
@@ -701,7 +719,7 @@ describe('service: pull an image in a terminal', () => {
     }])
     assert.deepEqual(t.log.remembered, [{ hostId: 'ssh:A', path: '/home/me/main' }])
     assert.deepEqual(t.log.switched, [{ environment: 'A', handle: 'term_1' }])
-    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.scan', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
     assert.deepEqual(t.log.sshRuns, [])
   })
 
@@ -714,8 +732,8 @@ describe('service: pull an image in a terminal', () => {
   test('a pull follows the Shell rules: kernel check, anchor, host status', async () => {
     const unknownKernel = setup({ kernel: null, anchor: { path: '/home/me/main' } })
     assert.equal((await unknownKernel.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS)).ok, true)
-    assert.deepEqual(unknownKernel.log.sshRuns, [{ env: 'A', commands: [], options: OPTIONS }])
-    assert.deepEqual(unknownKernel.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(unknownKernel.log.scans, [{ env: 'A', options: OPTIONS }])
+    assert.deepEqual(unknownKernel.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.scan', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
     const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
     const other = setup({ kernel: 'FreeBSD' })
     assert.deepEqual(await other.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), unsupported)
@@ -731,7 +749,7 @@ describe('service: pull an image in a terminal', () => {
       assert.deepEqual(t.calls, [])
     }
     for (const t of [other, down]) {
-      assert.deepEqual([...t.log.created, ...t.log.localTerminals, ...t.log.sshRuns], [])
+      assert.deepEqual([...t.log.created, ...t.log.localTerminals, ...t.log.sshRuns, ...t.log.scans], [])
     }
     const cliDown = setup()
     cliDown.failCreate(new CliError('cli_exec_failed', 'cannot reach'))
@@ -894,7 +912,7 @@ describe('service: Compose project actions', () => {
       } as unknown as Hosts
       const unused = async () => { throw new Error('must not be called') }
       const service = createService({
-        hosts, local, ssh: { run: unused }, cli: {} as OrcaCli, storage: { get: unused }, now: () => clock.now, openLocalTerminal: unused,
+        hosts, local, ssh: { run: unused, startupScan: unused }, cli: {} as OrcaCli, storage: { get: unused }, now: () => clock.now, openLocalTerminal: unused,
       })
       return { service, execs }
     }
@@ -1010,7 +1028,7 @@ describe('service: Compose up in a terminal', () => {
     assert.equal(t.calls.includes('createTerminal'), false)
   })
 
-  test('an SSH up on a Linux host: anchor, kernel, labels, then the plain command in an Orca terminal, remembered and switched to', async () => {
+  test('an SSH up on a Linux host: anchor, kernel, startup scan, labels, then the plain command in an Orca terminal, remembered and switched to', async () => {
     const t = setup({ anchor: { path: '/home/me/main' } })
     t.setSsh({ ok: true, value: [LABELS_OK] })
     const r = await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)
@@ -1021,7 +1039,7 @@ describe('service: Compose up in a terminal', () => {
     }])
     assert.deepEqual(t.log.remembered, [{ hostId: 'ssh:A', path: '/home/me/main' }])
     assert.deepEqual(t.log.switched, [{ environment: 'A', handle: 'term_1' }])
-    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.scan', `storage.get ${kernelKey('A')}`, 'ssh.run', 'createTerminal', 'remember', 'switchTo'])
   })
 
   test('an SSH up on a Darwin host types the macOS docker lookup', async () => {
@@ -1033,7 +1051,8 @@ describe('service: Compose up in a terminal', () => {
     checked.setCheckKernel('Darwin')
     checked.setSsh((commands) => ({ ok: true, value: byName({ labels: LABELS_OK })(commands) }))
     assert.equal((await checked.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)).ok, true)
-    assert.deepEqual(checked.log.sshRuns.map((run) => run.commands.map((c) => c.name)), [[], ['labels']])
+    assert.deepEqual(checked.log.sshRuns.map((run) => run.commands.map((c) => c.name)), [['labels']])
+    assert.equal(checked.log.scans.length, 1)
     assert.equal(checked.log.created[0]?.command, shellCommand(macTerminalArgv(composeUpArgv(SHOP))))
   })
 
@@ -1041,7 +1060,7 @@ describe('service: Compose up in a terminal', () => {
     const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
     const other = setup({ kernel: 'FreeBSD' })
     assert.deepEqual(await other.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), unsupported)
-    assert.deepEqual([...other.log.sshRuns, ...other.log.created], [])
+    assert.deepEqual([...other.log.sshRuns, ...other.log.scans, ...other.log.created], [])
     for (const missing of ['unreachable', 'no-workspace'] as const) {
       const t = setup({ anchor: { missing } })
       assert.deepEqual(await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS),
@@ -1057,9 +1076,10 @@ describe('service: Compose up in a terminal', () => {
     assert.deepEqual(noId.calls, [])
     const problem = { kind: 'timeout' as const, message: 'The ssh session to "A" did not finish in time' }
     const check = setup({ kernel: null })
-    check.setSsh({ ok: false, problem })
+    check.setScan({ ok: false, problem })
     assert.deepEqual(await check.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), { ok: false, problem })
-    assert.deepEqual(check.log.sshRuns.map((run) => run.commands), [[]])
+    assert.equal(check.log.scans.length, 1)
+    assert.deepEqual(check.log.sshRuns, [])
     assert.deepEqual(check.log.created, [])
   })
 
@@ -1126,6 +1146,195 @@ describe('service: Compose up in a terminal', () => {
   })
 })
 
+type Setup = ReturnType<typeof setup>
+type OpenTerminal = (t: Setup, allowStartupShell?: boolean) => Promise<Result<Opened>>
+// Shell, Logs (Open in terminal), Pull and Up, on SSH host A or on this Mac.
+const SSH_TERMINALS: Record<string, OpenTerminal> = {
+  shell: (t, allow) => t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS, allow),
+  logs: (t, allow) => t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS, allow),
+  pull: (t, allow) => t.service.pullTerminal('ssh:A', 'nginx:1.27', null, OPTIONS, allow),
+  up: (t, allow) => t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS, allow),
+}
+const LOCAL_TERMINALS: Record<string, OpenTerminal> = {
+  shell: (t, allow) => t.service.openTerminal('local', 'shell', ID, 'web', FOCUS, OPTIONS, allow),
+  logs: (t, allow) => t.service.openTerminal('local', 'logs', ID, 'web', FOCUS, OPTIONS, allow),
+  pull: (t, allow) => t.service.pullTerminal('local', 'nginx:1.27', FOCUS, OPTIONS, allow),
+  up: (t, allow) => t.service.composeUp('local', 'shop', MEMBER, FOCUS, OPTIONS, allow),
+}
+const FOUND: Result<string[] | null> = { ok: true, value: ['.bashrc', '.zshrc'] }
+const STARTUP_SHELL = { ok: false, problem: { kind: 'startup-shell', message: '.bashrc, .zshrc' } }
+const OPENED_MAIN = { ok: true, value: { opened: true, workspace: 'main' } }
+// Host A, anchored at /home/me/main, whose scan answers `scan` and whose labels lookup finds project shop.
+function scanSetup(scan: Result<string[] | null>, opts: Parameters<typeof setup>[0] = {}): Setup {
+  const t = setup({ anchor: { path: '/home/me/main' }, ...opts })
+  t.setScan(scan)
+  t.setSsh({ ok: true, value: [LABELS_OK] })
+  t.setLocal([LABELS_OK])
+  return t
+}
+
+describe('service: login startup files that may start tmux, screen or byobu', () => {
+  test('an SSH Shell, Logs, Pull or Up whose scan finds files answers startup-shell with their names and opens nothing', async () => {
+    for (const [name, open] of Object.entries(SSH_TERMINALS)) {
+      const t = scanSetup(FOUND)
+      assert.deepEqual(await open(t), STARTUP_SHELL, name)
+      assert.deepEqual(t.log.scans, [{ env: 'A', options: OPTIONS }], name)
+      // Up's labels lookup does not run either.
+      assert.deepEqual([...t.log.sshRuns, ...t.log.created, ...t.log.switched, ...t.log.remembered], [], name)
+    }
+  })
+
+  test('the same request with allowStartupShell opens without a scan; false is the same as no flag', async () => {
+    for (const [name, open] of Object.entries(SSH_TERMINALS)) {
+      const t = scanSetup(FOUND)
+      assert.deepEqual(await open(t, true), OPENED_MAIN, name)
+      assert.deepEqual(t.log.scans, [], name)
+      assert.equal(t.log.created.length, 1, name)
+      assert.deepEqual(t.log.remembered, [{ hostId: 'ssh:A', path: '/home/me/main' }], name)
+      assert.deepEqual(t.log.switched, [{ environment: 'A', handle: 'term_1' }], name)
+      const unflagged = scanSetup(FOUND)
+      assert.deepEqual(await open(unflagged, false), STARTUP_SHELL, name)
+      assert.deepEqual(unflagged.log.created, [], name)
+    }
+  })
+
+  test('with the flag and no kernel stored, the kernel check is the empty run, as before', async () => {
+    const t = scanSetup(FOUND, { kernel: null })
+    assert.deepEqual(await SSH_TERMINALS.shell!(t, true), OPENED_MAIN)
+    assert.deepEqual(t.log.sshRuns, [{ env: 'A', commands: [], options: OPTIONS }])
+    assert.deepEqual(t.log.scans, [])
+    const problem = { kind: 'ssh-failed' as const, message: 'No ssh host named "A" on this Mac.' }
+    const failed = scanSetup(FOUND, { kernel: null })
+    failed.setSsh({ ok: false, problem })
+    assert.deepEqual(await SSH_TERMINALS.pull!(failed, true), { ok: false, problem })
+    assert.deepEqual(failed.log.created, [])
+  })
+
+  // Review Focus 3: with the kernel known there is no kernel check to answer, so a scan that fails never blocks.
+  test('on a host with a known kernel, a scan that fails or gives no answer opens the terminal, and the failure is logged', async () => {
+    const answers: Result<string[] | null>[] = [
+      { ok: false, problem: { kind: 'ssh-failed', message: 'ssh to "A" failed: ssh: connect to host a port 22: Connection refused.' } },
+      { ok: false, problem: { kind: 'timeout', message: 'The ssh session to "A" did not finish in time' } },
+      { ok: false, problem: { kind: 'failed', message: 'The ssh session to "A" ended before docker finished.' } },
+      { ok: true, value: null },
+    ]
+    for (const answer of answers) {
+      for (const [name, open] of Object.entries(SSH_TERMINALS)) {
+        const t = scanSetup(answer)
+        assert.deepEqual(await open(t), OPENED_MAIN, `${name} ${JSON.stringify(answer)}`)
+        assert.equal(t.log.created.length, 1)
+        const why = answer.ok ? 'no answer' : answer.problem.message
+        assert.deepEqual(t.log.logs, [`startup file scan on A failed: ${why}`])
+      }
+    }
+  })
+
+  test('with no kernel stored, the scan is the kernel check: one ssh run; findings answer startup-shell, no answer opens', async () => {
+    const found = scanSetup({ ok: true, value: ['.profile'] }, { kernel: null })
+    found.setCheckKernel('Linux')
+    assert.deepEqual(await SSH_TERMINALS.up!(found), { ok: false, problem: { kind: 'startup-shell', message: '.profile' } })
+    assert.deepEqual(found.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.scan'])
+    // The run read the kernel, so the scan's missing answer does not block; the kernel it stored picks the command.
+    const noAnswer = scanSetup({ ok: true, value: null }, { kernel: null })
+    noAnswer.setCheckKernel('Linux')
+    assert.deepEqual(await SSH_TERMINALS.shell!(noAnswer), OPENED_MAIN)
+    assert.deepEqual(noAnswer.log.created.map((c) => c.command), [shellCommand(terminalArgv('shell', ID))])
+    assert.deepEqual(noAnswer.log.sshRuns, [])
+  })
+
+  test('a local Shell, Logs, Pull or Up never scans, with or without the flag', async () => {
+    for (const allow of [undefined, false, true]) {
+      for (const [name, open] of Object.entries(LOCAL_TERMINALS)) {
+        const t = scanSetup(FOUND, { anchor: { path: '/w', workspaceId: 'ws1', name: 'proj' } })
+        assert.deepEqual(await open(t, allow), { ok: true, value: { opened: true, workspace: 'proj' } }, `${name} ${allow}`)
+        assert.deepEqual(t.log.scans, [], `${name} ${allow}`)
+        assert.equal(t.log.localTerminals.length, 1, `${name} ${allow}`)
+      }
+    }
+  })
+
+  // A scan cut off by the request's own end (the panel gave up, or the plugin is stopping) is not a scan failure.
+  test('a request aborted during the scan opens nothing, even on a host with a known kernel', async () => {
+    const problem = { kind: 'timeout' as const, message: 'The ssh session to "A" did not finish in time' }
+    for (const kernel of ['Linux', null]) {
+      const ctl = new AbortController()
+      const t = scanSetup(FOUND, { kernel })
+      t.setCheckKernel('Linux') // with none stored before: READY came, then the abort
+      t.setScan(() => { ctl.abort(); return { ok: false, problem } })
+      const r = await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, { deadline: 10_000, signal: ctl.signal })
+      assert.deepEqual(r, { ok: false, problem }, String(kernel))
+      assert.deepEqual([...t.log.created, ...t.log.remembered, ...t.log.switched], [], String(kernel))
+    }
+  })
+
+  // Fix round 2, Minor 3: the work budget used up ends the request as an abort does. The setups' clock reads 4242.
+  test('a scan that failed once the work budget was used up opens nothing, even on a host with a known kernel', async () => {
+    const problem = { kind: 'timeout' as const, message: 'The ssh session to "A" did not finish in time' }
+    const t = scanSetup({ ok: false, problem })
+    assert.deepEqual(await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, { deadline: 4242 }), { ok: false, problem })
+    assert.deepEqual([...t.log.created, ...t.log.remembered, ...t.log.switched], [])
+    const stalled = scanSetup({ ok: false, problem }, { kernel: null })
+    stalled.setCheckKernel('Linux')
+    assert.deepEqual(await stalled.service.pullTerminal('ssh:A', 'nginx:1.27', null, { deadline: 4000 }), { ok: false, problem })
+    assert.deepEqual(stalled.log.created, [])
+    // One millisecond left: a failed scan on a host with a known kernel opens, as before.
+    const inTime = scanSetup({ ok: false, problem })
+    assert.deepEqual(await inTime.service.openTerminal('ssh:A', 'shell', ID, 'web', null, { deadline: 4243 }), OPENED_MAIN)
+  })
+
+  // Fix round 2, Minor 1: the scan's own run reads the kernel, so what it says wins over what was stored before.
+  test('a scan that answers unsupported is returned as it is and opens nothing, whatever kernel was stored before', async () => {
+    const problem = { kind: 'unsupported' as const, message: 'Remote kernel FreeBSD is not supported' }
+    for (const [name, open] of Object.entries(SSH_TERMINALS)) {
+      for (const kernel of ['Linux', 'Darwin', null]) {
+        const t = scanSetup({ ok: false, problem }, { kernel })
+        assert.deepEqual(await open(t), { ok: false, problem }, `${name} ${kernel}`)
+        assert.deepEqual([...t.log.created, ...t.log.sshRuns, ...t.log.remembered, ...t.log.logs], [], `${name} ${kernel}`)
+      }
+    }
+  })
+
+  test('after a scan run, the kernel it stored picks the typed command over the one stored before', async () => {
+    const t = scanSetup({ ok: true, value: [] }, { kernel: 'Linux' })
+    t.setCheckKernel('Darwin')
+    assert.deepEqual(await SSH_TERMINALS.shell!(t), OPENED_MAIN)
+    assert.deepEqual(t.log.created.map((c) => c.command), [shellCommand(macTerminalArgv(terminalArgv('shell', ID)))])
+    // A failed scan that still stored a kernel: the same.
+    const failed = scanSetup({ ok: false, problem: { kind: 'timeout', message: 'slow' } }, { kernel: 'Darwin' })
+    failed.setCheckKernel('Linux')
+    assert.deepEqual(await SSH_TERMINALS.pull!(failed), OPENED_MAIN)
+    assert.deepEqual(failed.log.created.map((c) => c.command), [shellCommand(pullArgv('nginx:1.27'))])
+    // A kernel record that cannot be read after the run keeps the one read before.
+    const unreadable = scanSetup({ ok: true, value: [] }, { kernel: 'Linux' })
+    unreadable.setScan(() => { unreadable.failStorageRead(); return { ok: true, value: [] } })
+    assert.deepEqual(await SSH_TERMINALS.logs!(unreadable), OPENED_MAIN)
+    assert.deepEqual(unreadable.log.created.map((c) => c.command), [shellCommand(terminalArgv('logs', ID))])
+  })
+
+  // Fix round 2, Minor 2: READY came (the runner stored the kernel), then the run stalled or dropped.
+  test('with no kernel stored before, a scan that timed out or failed after storing a supported kernel opens, and is logged', async () => {
+    for (const kind of ['timeout', 'failed'] as const) {
+      for (const [stored, argv] of [['Linux', terminalArgv('logs', ID)], ['Darwin', macTerminalArgv(terminalArgv('logs', ID))]] as const) {
+        const t = scanSetup({ ok: false, problem: { kind, message: `scan ${kind}` } }, { kernel: null })
+        t.setCheckKernel(stored)
+        assert.deepEqual(await SSH_TERMINALS.logs!(t), OPENED_MAIN, `${kind} ${stored}`)
+        assert.deepEqual(t.log.created.map((c) => c.command), [shellCommand(argv)], `${kind} ${stored}`)
+        assert.deepEqual(t.log.logs, [`startup file scan on A failed: scan ${kind}`], `${kind} ${stored}`)
+      }
+    }
+    // Nothing stored meanwhile: the scan's failure answers, as the kernel check's did.
+    const none = scanSetup({ ok: false, problem: { kind: 'timeout', message: 'slow' } }, { kernel: null })
+    assert.deepEqual(await SSH_TERMINALS.logs!(none), { ok: false, problem: { kind: 'timeout', message: 'slow' } })
+    // Any other kind answers even when a kernel was stored.
+    for (const kind of ['ssh-failed', 'truncated'] as const) {
+      const t = scanSetup({ ok: false, problem: { kind, message: kind } }, { kernel: null })
+      t.setCheckKernel('Linux')
+      assert.deepEqual(await SSH_TERMINALS.up!(t), { ok: false, problem: { kind, message: kind } }, kind)
+      assert.deepEqual([...t.log.created, ...t.log.sshRuns], [], kind)
+    }
+  })
+})
+
 // The real host list over a fake Orca CLI: GPU2's workspace listing fails (Orca's runtime there is down), cloud-gpu lists none,
 // and GPU3's listing answers without covering the host (connected, but no repo there). Orca's listing must not keep any
 // of them from ssh.
@@ -1164,6 +1373,10 @@ function listingSetup(opts: { sshProblem?: Problem } = {}) {
       runs.push({ env, names })
       if (opts.sshProblem) return { ok: false, problem: opts.sshProblem }
       return { ok: true, value: answers[names.includes('action') ? 'action' : names.includes('logs') ? 'logs' : 'snapshot']! }
+    },
+    async startupScan(env) {
+      runs.push({ env, names: ['startup'] })
+      return opts.sshProblem ? { ok: false, problem: opts.sshProblem } : { ok: true, value: [] }
     },
   }
   const local: LocalRunner = { async run() { throw new Error('local.run must not be called') } }

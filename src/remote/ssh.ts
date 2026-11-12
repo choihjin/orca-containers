@@ -4,7 +4,7 @@ import { cleanLabel, type CommandResult } from '../docker/parse'
 import { isSupportedRemoteKernel } from '../platform'
 import type { ProblemKind, Result, RunOptions } from '../protocol'
 import { extractRun, readyInfo } from './markers'
-import { sshScript } from './script'
+import { sshScript, STARTUP_FILES, startupScript } from './script'
 
 export type KeyValueStore = { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void>; delete(key: string): Promise<void> }
 export const kernelKey = (env: string) => `kernel:${env}` // string: the kernel the host last reported
@@ -134,10 +134,23 @@ export function nodeSshExec(options: SshExecOptions = {}): SshExec {
 
 // localName: how messages name the computer the ssh runs from (localNameInText: 'this Mac', or 'this computer' on Linux).
 export type SshRunnerDeps = { exec: SshExec; storage: KeyValueStore; now: () => number; randomHex: () => string; sshPath?: string; localName: string }
-export type SshRunner = { run(env: string, commands: readonly DockerCommand[], options: RunOptions): Promise<Result<CommandResult[]>> }
+export type SshRunner = {
+  run(env: string, commands: readonly DockerCommand[], options: RunOptions): Promise<Result<CommandResult[]>>
+  // Reads the host's login startup files (startupScript): the paths in $HOME of those that seem to start tmux, screen
+  // or byobu, in STARTUP_FILES order, or null when the run finished without the scan's answer. It fails as a run with no
+  // command does, so it also checks (and stores) the kernel.
+  startupScan(env: string, options: RunOptions): Promise<Result<string[] | null>>
+}
 
 const fail = (kind: ProblemKind, message: string): Result<never> => ({ ok: false, problem: { kind, message } })
 const unknownResult = () => fail('unknown-result', 'sent; result unknown')
+
+// The scan's answer is its `startup` section of code 0. Only the scanned files' paths are kept, once each, in scan order.
+function startupAnswer(results: readonly CommandResult[]): string[] | null {
+  const section = results.find((r) => r.name === 'startup')
+  if (section?.code !== 0) return null
+  return STARTUP_FILES.filter((path) => section.lines.includes(path))
+}
 
 // ssh's own failure (exit 255 before the script said READY), told apart by its stderr.
 function sshFailure(env: string, stderr: string, here: string): Result<never> {
@@ -155,50 +168,60 @@ function sshFailure(env: string, stderr: string, here: string): Result<never> {
 export function createSshRunner(deps: SshRunnerDeps): SshRunner {
   const sshPath = deps.sshPath ?? SSH_PATH
   const here = deps.localName
-  return {
-    // Runs on one host may overlap: each run is its own ssh process with its own nonce.
-    async run(env, commands, options) {
-      let args: string[]
+  // Runs on one host may overlap: each run is its own ssh process with its own nonce. `script` builds the stdin from it;
+  // `commands` are the docker commands in it.
+  async function execute(
+    env: string, commands: readonly DockerCommand[], script: (nonce: string) => string, options: RunOptions,
+  ): Promise<Result<CommandResult[]>> {
+    let args: string[]
+    try {
+      args = sshArgs(env)
+    } catch (error) {
+      if (error instanceof InvalidInputError) return fail('ssh-failed', error.message)
+      throw error
+    }
+    const remaining = options.deadline - deps.now()
+    if (options.signal?.aborted || remaining <= 0) return fail('timeout', 'The request ran out of time before ssh started')
+    const nonce = deps.randomHex()
+    if (!NONCE_RE.test(nonce)) throw new Error('randomHex must return 8 lowercase hex digits')
+
+    const out = await deps.exec(sshPath, args, {
+      input: script(nonce),
+      timeoutMs: Math.min(SSH_RUN_TIMEOUT_MS, remaining),
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+    if (out.spawnError !== undefined) return fail('ssh-failed', `The ssh command could not start on ${here}: ${out.spawnError}.`)
+
+    const lines = out.stdout.split('\n')
+    const ready = readyInfo(lines, nonce)
+    const run = extractRun(lines, nonce)
+    // We ended it (deadline or abort), not ssh; its stderr and exit code then say nothing about ssh.
+    const stopped = out.timedOut || options.signal?.aborted === true
+    // Once the script could have reached it, an unfinished action, remove or compose may have been carried out.
+    const maybeSent = !run.complete && commands.some((c) => c.name === 'action' || c.name === 'remove' || c.name === 'compose')
+      && (ready !== null || stopped || out.overflow === true)
+    if (out.overflow) return maybeSent ? unknownResult() : fail('truncated', `The output from "${env}" passed ${SSH_STDOUT_MAX / 1024 / 1024} MiB`)
+    if (ready) {
       try {
-        args = sshArgs(env)
-      } catch (error) {
-        if (error instanceof InvalidInputError) return fail('ssh-failed', error.message)
-        throw error
+        await deps.storage.set(kernelKey(env), ready.kernel)
+      } catch {
+        // best effort: the host list only loses this hint, the answer below stands
       }
-      const remaining = options.deadline - deps.now()
-      if (options.signal?.aborted || remaining <= 0) return fail('timeout', 'The request ran out of time before ssh started')
-      const nonce = deps.randomHex()
-      if (!NONCE_RE.test(nonce)) throw new Error('randomHex must return 8 lowercase hex digits')
+      if (!isSupportedRemoteKernel(ready.kernel)) return fail('unsupported', `Remote kernel ${cleanText(ready.kernel, 64)} is not supported`)
+    }
+    if (run.complete) return { ok: true, value: run.results }
+    if (maybeSent) return unknownResult()
+    if (stopped) return fail('timeout', `The ssh session to "${env}" did not finish in time`)
+    if (!ready && out.code === 255) return sshFailure(env, out.stderr, here)
+    return fail('failed', `The ssh session to "${env}" ended before docker finished.`)
+  }
 
-      const out = await deps.exec(sshPath, args, {
-        input: sshScript(nonce, commands),
-        timeoutMs: Math.min(SSH_RUN_TIMEOUT_MS, remaining),
-        ...(options.signal ? { signal: options.signal } : {}),
-      })
-      if (out.spawnError !== undefined) return fail('ssh-failed', `The ssh command could not start on ${here}: ${out.spawnError}.`)
-
-      const lines = out.stdout.split('\n')
-      const ready = readyInfo(lines, nonce)
-      const run = extractRun(lines, nonce)
-      // We ended it (deadline or abort), not ssh; its stderr and exit code then say nothing about ssh.
-      const stopped = out.timedOut || options.signal?.aborted === true
-      // Once the script could have reached it, an unfinished action, remove or compose may have been carried out.
-      const maybeSent = !run.complete && commands.some((c) => c.name === 'action' || c.name === 'remove' || c.name === 'compose')
-        && (ready !== null || stopped || out.overflow === true)
-      if (out.overflow) return maybeSent ? unknownResult() : fail('truncated', `The output from "${env}" passed ${SSH_STDOUT_MAX / 1024 / 1024} MiB`)
-      if (ready) {
-        try {
-          await deps.storage.set(kernelKey(env), ready.kernel)
-        } catch {
-          // best effort: the host list only loses this hint, the answer below stands
-        }
-        if (!isSupportedRemoteKernel(ready.kernel)) return fail('unsupported', `Remote kernel ${cleanText(ready.kernel, 64)} is not supported`)
-      }
-      if (run.complete) return { ok: true, value: run.results }
-      if (maybeSent) return unknownResult()
-      if (stopped) return fail('timeout', `The ssh session to "${env}" did not finish in time`)
-      if (!ready && out.code === 255) return sshFailure(env, out.stderr, here)
-      return fail('failed', `The ssh session to "${env}" ended before docker finished.`)
+  return {
+    run: (env, commands, options) => execute(env, commands, (nonce) => sshScript(nonce, commands), options),
+    // No docker command: it changes nothing on the host, so a run cut off is never unknown-result.
+    async startupScan(env, options) {
+      const ran = await execute(env, [], startupScript, options)
+      return ran.ok ? { ok: true, value: startupAnswer(ran.value) } : ran
     },
   }
 }

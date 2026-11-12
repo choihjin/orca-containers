@@ -3,7 +3,7 @@ import { settings, type TreeItem } from 'orca'
 import {
   afterEach, assert, hostError, mockHost, mount, test, type MockRequests, type MountOptions, type TestPanel, type TreeSnapshot,
 } from 'orca/testing'
-import type { ContainerRow, ContainerState, HostId, HostInfo, Result, Snapshot } from './protocol'
+import type { ContainerRow, ContainerState, HostId, HostInfo, Opened, Result, Snapshot } from './protocol'
 import { messages } from './i18n'
 import * as panel from './panel'
 
@@ -2152,6 +2152,225 @@ test("an Up's late note shows only on its card, and an answer that comes after a
   clean(v)
 })
 
+// An SSH host whose login files seem to start tmux, screen or byobu: the worker opens nothing and answers startup-shell
+// with the files, and the card offers Open anyway.
+const STARTUP_FILES = '.bashrc, .config/fish/config.fish'
+const STARTUP_TITLE = 'This host may start tmux, screen or byobu'
+const STARTUP_WARNING = `This host's login files (${STARTUP_FILES}) may start tmux, screen or byobu. The command could be typed into that session.`
+const OPEN_ANYWAY = { testId: 'open-anyway' }
+// As the worker answers for such a host: refused until the request carries allowStartupShell.
+const loginFileCheck = (input: { allowStartupShell?: boolean }): Result<Opened> => input.allowStartupShell === true
+  ? ok({ opened: true as const, workspace: 'proj' })
+  : { ok: false, problem: { kind: 'startup-shell', message: STARTUP_FILES } }
+// Every host lists the shop project, a container of its own, and the images, volumes and networks.
+const anyHost: MockRequests = { 'docker.snapshot': ({ hostId }) => ok(resourceSnap(hostId, COMPOSE)) }
+const openImages = async (v: TestPanel) => {
+  if (v.valueOf(section('Images')) !== true) await v.toggle(section('Images'))
+}
+type TerminalButton = {
+  name: string
+  request: 'docker.openTerminal' | 'docker.pullTerminal' | 'docker.composeUp'
+  // Shows the button on the host selected (again after a host change): its item picked, its section or log view open.
+  reach: (v: TestPanel) => Promise<void>
+  press: (v: TestPanel) => Promise<void>
+  // What the press sends on GPU1.
+  input: Record<string, unknown>
+  note: string
+  // The card the warning and the note go to; null: the pull row's.
+  card: string | null
+  // Another item, picked while the request is out.
+  other: (v: TestPanel) => Promise<void>
+}
+const TERMINAL_BUTTONS: TerminalButton[] = [
+  {
+    name: 'Shell', request: 'docker.openTerminal', reach: (v) => v.selectItem(CONTAINERS, WEB), press: (v) => v.press({ testId: 'shell' }),
+    input: { hostId: 'ssh:GPU1', kind: 'shell', containerId: WEB, containerName: 'web' }, note: 'Opened shell in proj.', card: 'web',
+    other: (v) => v.selectItem(CONTAINERS, SHOP_WEB),
+  },
+  {
+    name: 'Open in terminal (logs)', request: 'docker.openTerminal',
+    reach: async (v) => {
+      await v.selectItem(CONTAINERS, WEB)
+      if (v.find(LOGS_TERMINAL) === null) await v.press({ testId: 'logs' })
+    },
+    press: (v) => v.press(LOGS_TERMINAL),
+    input: { hostId: 'ssh:GPU1', kind: 'logs', containerId: WEB, containerName: 'web' }, note: 'Opened logs in proj.', card: 'web',
+    other: (v) => v.selectItem(CONTAINERS, SHOP_WEB),
+  },
+  {
+    name: 'Pull on an image card', request: 'docker.pullTerminal',
+    reach: async (v) => {
+      await openImages(v)
+      await v.selectItem(IMAGES, NGINX_STABLE)
+    },
+    press: (v) => v.press({ testId: 'pull' }),
+    input: { hostId: 'ssh:GPU1', ref: 'nginx:stable' }, note: 'Opened pull: nginx:stable in proj.', card: 'nginx:stable',
+    other: (v) => v.selectItem(IMAGES, NGINX_LATEST),
+  },
+  {
+    name: 'Pull by name', request: 'docker.pullTerminal',
+    reach: async (v) => {
+      await openImages(v)
+      await v.type(PULL_INPUT, 'redis:7', { replace: true })
+    },
+    press: (v) => v.press(PULL_BY_NAME),
+    input: { hostId: 'ssh:GPU1', ref: 'redis:7' }, note: 'Opened pull: redis:7 in proj.', card: null,
+    other: (v) => v.selectItem(IMAGES, NGINX_LATEST),
+  },
+  {
+    name: 'Compose Up', request: 'docker.composeUp', reach: (v) => v.selectItem(CONTAINERS, SHOP), press: (v) => v.press({ testId: 'project-up' }),
+    input: { hostId: 'ssh:GPU1', project: 'shop', memberId: SHOP_WEB }, note: UP_NOTE, card: 'shop',
+    other: (v) => v.selectItem(CONTAINERS, WEB),
+  },
+]
+const allowed = (input: Record<string, unknown>) => ({ ...input, allowStartupShell: true })
+
+for (const c of TERMINAL_BUTTONS) {
+  test(`${c.name}: a startup-shell answer warns with the login files, and Open anyway sends the same request with allowStartupShell`, async () => {
+    const v = await open({ ...anyHost, [c.request]: loginFileCheck })
+    const own = () => c.card === null ? v.find({ testId: 'pull-row' }) : card(v)
+    await v.select(HOST, 'ssh:GPU1')
+    await c.reach(v)
+    await c.press(v)
+    assert.deepEqual(sent(v, c.request).map((s) => [s.input, s.timeoutMs]), [[c.input, 110_000]])
+    assert.ok(v.summary().includes(`Callout warning "${STARTUP_TITLE}"`), v.summary().join('\n'))
+    assert.equal(v.findAll({ type: 'Callout' }).length, 1)
+    assert.ok(v.find({ text: STARTUP_WARNING }), v.summary().join('\n'))
+    assert.equal(v.find(OPEN_ANYWAY)?.text, 'Open anyway')
+    assert.equal(v.find({ text: c.note }), null)
+    // On the card (or under the pull row) the request was for.
+    if (c.card !== null) assert.equal(card(v)?.label, c.card)
+    assert.ok(own()?.text.includes(STARTUP_WARNING), own()?.text)
+    assert.ok(own()?.text.includes('Open anyway'), own()?.text)
+
+    await v.press(OPEN_ANYWAY)
+    assert.deepEqual(sent(v, c.request).map((s) => [s.input, s.timeoutMs]), [[c.input, 110_000], [allowed(c.input), 110_000]])
+    assert.ok(v.find({ text: c.note }), v.summary().join('\n'))
+    assert.ok(own()?.text.includes(c.note), own()?.text)
+    assert.equal(v.find({ text: STARTUP_WARNING }), null)
+    assert.equal(v.find(OPEN_ANYWAY), null)
+    assert.equal(v.find({ type: 'Callout' }), null)
+
+    // The flag went with that press only: the button sends without it, and is warned again.
+    await c.press(v)
+    assert.deepEqual(sent(v, c.request).map((s) => s.input), [c.input, allowed(c.input), c.input])
+    assert.ok(v.find({ text: STARTUP_WARNING }), v.summary().join('\n'))
+    assert.equal(v.find({ text: c.note }), null)
+    clean(v)
+  })
+
+  test(`${c.name}: the warning and its Open anyway answer stay with their item, and one after a host change shows nowhere`, async () => {
+    let during: ((w: TestPanel) => Promise<void>) | null = null
+    let acting: Promise<void> | undefined
+    const v = await open({
+      ...anyHost,
+      [c.request]: async (input: { allowStartupShell?: boolean }) => {
+        acting = during?.(view!)
+        await nextTurn()
+        return loginFileCheck(input)
+      },
+    })
+    const warned = () => v.find({ text: STARTUP_WARNING })
+    const noted = () => v.find({ text: c.note })
+    const own = () => c.card === null ? v.find({ testId: 'pull-row' }) : card(v)
+    await v.select(HOST, 'ssh:GPU1')
+    await c.reach(v)
+
+    // Another item is picked while the request is out: the warning, then the note, go to the item they were for.
+    during = c.other
+    await c.press(v)
+    await acting
+    await v.settled()
+    if (c.card !== null) {
+      assert.notEqual(card(v)?.label, c.card)
+      assert.equal(warned(), null)
+      assert.equal(v.find(OPEN_ANYWAY), null)
+      await c.reach(v)
+    } else {
+      // The pull row's warning stays under the row, not on the image card picked meanwhile.
+      assert.equal(card(v)?.label, 'nginx:latest')
+      assert.equal(card(v)?.text.includes(STARTUP_WARNING), false)
+    }
+    assert.ok(own()?.text.includes(STARTUP_WARNING), own()?.text)
+    await v.press(OPEN_ANYWAY)
+    await acting
+    await v.settled()
+    if (c.card !== null) {
+      assert.equal(noted(), null)
+      await c.reach(v)
+    }
+    assert.ok(noted(), v.summary().join('\n'))
+
+    // Another host is picked while the request is out: the warning shows nowhere.
+    during = (w) => w.select(HOST, 'local')
+    await c.press(v)
+    await acting
+    await v.settled()
+    assert.equal(v.valueOf(HOST), 'local')
+    assert.equal(warned(), null)
+    assert.equal(v.find(OPEN_ANYWAY), null)
+    during = null
+    await v.select(HOST, 'ssh:GPU1')
+    await c.reach(v)
+    assert.equal(warned(), null)
+
+    // Nor does the note of an Open anyway whose answer comes after a host change.
+    await c.press(v)
+    assert.ok(warned(), v.summary().join('\n'))
+    during = (w) => w.select(HOST, 'local')
+    await v.press(OPEN_ANYWAY)
+    await acting
+    await v.settled()
+    assert.equal(v.valueOf(HOST), 'local')
+    assert.equal(noted(), null)
+    during = null
+    await v.select(HOST, 'ssh:GPU1')
+    await c.reach(v)
+    assert.equal(noted(), null)
+    assert.equal(warned(), null)
+    assert.deepEqual(sent(v, c.request).map((s) => s.input), [c.input, allowed(c.input), c.input, c.input, allowed(c.input)])
+    clean(v)
+  })
+}
+
+// Open anyway would pull the name pressed before, so a new name drops the pull row's warning.
+test("a new image name drops the pull row's startup-shell warning; its other problems and a card's warning stay", async () => {
+  const v = await open({
+    ...anyHost,
+    'docker.pullTerminal': (input) => input.ref === 'nowhere:1' ? { ok: false, problem: { kind: 'no-workspace', message: 'none' } } : loginFileCheck(input),
+  })
+  const warned = () => v.find({ text: STARTUP_WARNING })
+  const pulled = () => sent(v, 'docker.pullTerminal').map((s) => s.input)
+  await v.select(HOST, 'ssh:GPU1')
+  await openImages(v)
+  await v.type(PULL_INPUT, 'redis:7')
+  await v.press(PULL_BY_NAME)
+  assert.ok(warned(), v.summary().join('\n'))
+  await v.type(PULL_INPUT, '.2')
+  assert.equal(v.valueOf(PULL_INPUT), 'redis:7.2')
+  assert.equal(warned(), null)
+  assert.equal(v.find(OPEN_ANYWAY), null)
+  assert.equal(v.find({ type: 'Callout' }), null)
+  assert.deepEqual(pulled(), [{ hostId: 'ssh:GPU1', ref: 'redis:7' }])
+
+  // Any other problem of the row stays while the name changes, as before.
+  await v.type(PULL_INPUT, 'nowhere:1', { replace: true })
+  await v.press(PULL_BY_NAME)
+  assert.ok(v.summary().includes('Callout danger "No workspace on this host"'), v.summary().join('\n'))
+  await v.type(PULL_INPUT, 'nowhere:2', { replace: true })
+  assert.ok(v.summary().includes('Callout danger "No workspace on this host"'), v.summary().join('\n'))
+
+  // So does an image card's warning: the field is not what its Pull sends.
+  await v.selectItem(IMAGES, NGINX_STABLE)
+  await v.press({ testId: 'pull' })
+  assert.ok(card(v)?.text.includes(STARTUP_WARNING), card(v)?.text)
+  await v.type(PULL_INPUT, 'redis:8', { replace: true })
+  assert.ok(card(v)?.text.includes(STARTUP_WARNING), card(v)?.text)
+  assert.equal(v.find(OPEN_ANYWAY)?.text, 'Open anyway')
+  assert.deepEqual(pulled(), [{ hostId: 'ssh:GPU1', ref: 'redis:7' }, { hostId: 'ssh:GPU1', ref: 'nowhere:1' }, { hostId: 'ssh:GPU1', ref: 'nginx:stable' }])
+  clean(v)
+})
+
 // Korean. The panel follows Orca's UI language unless its Language setting picks one; the copy comes from i18n.ts.
 
 const TEXT_PROPS = new Set(['label', 'title', 'description', 'placeholder'])
@@ -2447,6 +2666,43 @@ test('the project card in Korean: its fields, buttons, Down question, Up note an
   await v.press({ testId: 'project-restart' })
   assert.ok(v.summary().includes('Callout danger "결과를 알 수 없습니다"'), v.summary().join('\n'))
   assert.deepEqual(englishLeft(v), [])
+  clean(v)
+})
+
+test('the startup-shell warning and Open anyway in Korean, for each button that opens a terminal', async () => {
+  const v = await open({
+    ...anyHost, 'docker.openTerminal': loginFileCheck, 'docker.pullTerminal': loginFileCheck, 'docker.composeUp': loginFileCheck,
+  }, { locale: 'ko' })
+  const KO_IMAGES = { type: 'Tree', label: '이미지' }
+  // The warning, then Open anyway and the note it leaves; the file list is the worker's, as it came.
+  const openAnyway = async (note: string) => {
+    assert.ok(v.summary().includes('Callout warning "이 호스트는 tmux, screen 또는 byobu를 띄울 수 있습니다"'), v.summary().join('\n'))
+    assert.ok(v.find({ text: `이 호스트의 로그인 파일(${STARTUP_FILES})이 tmux, screen 또는 byobu를 띄울 수 있습니다. 명령이 그 세션에 입력될 수 있습니다.` }),
+      v.summary().join('\n'))
+    assert.equal(v.find(OPEN_ANYWAY)?.text, '그래도 열기')
+    assert.deepEqual(englishLeft(v), [])
+    await v.press(OPEN_ANYWAY)
+    assert.ok(v.find({ text: note }), v.summary().join('\n'))
+    assert.equal(v.find(OPEN_ANYWAY), null)
+  }
+  await v.select({ label: '호스트' }, 'ssh:GPU1')
+  await v.selectItem(KO_CONTAINERS, WEB)
+  await v.press({ testId: 'shell' })
+  await openAnyway('proj에 Shell을 열었습니다.')
+  await v.press({ testId: 'logs' })
+  await v.press(LOGS_TERMINAL)
+  await openAnyway('proj에 로그 터미널을 열었습니다.')
+  await v.selectItem(KO_CONTAINERS, SHOP)
+  await v.press({ testId: 'project-up' })
+  await openAnyway('proj에 shop compose up 터미널을 열었습니다.')
+  await v.toggle(section('이미지'))
+  await v.selectItem(KO_IMAGES, NGINX_STABLE)
+  await v.press({ testId: 'pull' })
+  await openAnyway('proj에 nginx:stable Pull 터미널을 열었습니다.')
+  await v.type({ label: 'Pull할 이미지' }, 'redis:7')
+  await v.press(PULL_BY_NAME)
+  await openAnyway('proj에 redis:7 Pull 터미널을 열었습니다.')
+  assert.equal(sent(v, 'docker.openTerminal').length + sent(v, 'docker.pullTerminal').length + sent(v, 'docker.composeUp').length, 10)
   clean(v)
 })
 

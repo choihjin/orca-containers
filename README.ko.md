@@ -90,10 +90,10 @@ Orca에서 **Settings → Plugins**를 열고 **Add plugin → From a Git URL…
 저장소 주소를 붙여 넣어 설치합니다.
 
 ```text
-https://github.com/choihjin/orca-containers#v0.4.0
+https://github.com/choihjin/orca-containers#v0.5.0
 ```
 
-터미널에서는 `orca plugin install choihjin/orca-containers@v0.4.0`으로도 설치할 수 있습니다(Linux에서는 `orca-ide plugin install …`).
+터미널에서는 `orca plugin install choihjin/orca-containers@v0.5.0`으로도 설치할 수 있습니다(Linux에서는 `orca-ide plugin install …`).
 
 Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. 확인한 뒤 켜세요.
 
@@ -137,8 +137,18 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
 - SSH 호스트의 응답이 64 MiB를 넘으면 보여 주지 않고 패널에 "List too long"이 표시됩니다.
 - 패널의 로그는 한 줄을 500자에서 자르고, 15,000자 안에 들어가는 최근 줄만 보여 줍니다. Open in terminal에서는
   잘리지 않고 보입니다.
-- SSH 호스트의 로그인 셸 시작 파일이 tmux나 screen을 자동으로 붙이면, Shell, Open in terminal, Pull, Compose Up의
-  docker 명령이 그 프로그램에 입력될 수 있습니다.
+- Orca는 터미널의 명령을 호스트의 로그인 셸이 띄운 프로그램에 그대로 입력합니다. 그래서 그 호스트에서 tmux, screen,
+  byobu 세션이 뜨면 명령이 그 세션에 들어갈 수 있습니다. SSH 호스트에서 Shell, Open in terminal, Pull, Compose Up이
+  터미널을 열기 전에, 플러그인은 그 호스트 홈 폴더의 로그인 파일(`.bashrc`, `.bash_profile`, `.bash_login`,
+  `.profile`, `.zshrc`, `.zprofile`, `.zlogin`, `.zshenv`, `.config/fish/config.fish`)을 실행하지 않고 읽기만
+  합니다. tmux, screen, byobu가 적힌 줄이 있으면 아무것도 열지 않고, 패널에 그 파일을 적은 경고를 보여 줍니다. **Open
+  anyway**(한국어 화면에서는 **그래도 열기**)를 누르면 요청한 대로 터미널을 엽니다. 이 Mac은 확인하지 않습니다.
+  파일 내용만 보고 추측하므로, 놓치거나 잘못 경고할 수 있습니다.
+  - `#` 뒤는 주석으로 보고 무시합니다. 그래서 따옴표 안의 `#`도 그 줄의 나머지를 가립니다.
+  - tmux를 언급하기만 하는 줄도 걸립니다. 예를 들어 oh-my-zsh의 `plugins=(... tmux)` 줄은 자동 실행을 꺼 두어도
+    걸립니다.
+  - 다른 곳에서 source하는 파일과 /etc의 파일은 읽지 않습니다.
+  - 파일을 읽지 못하면(ssh 오류나 시간 초과) 막지 않고, 예전처럼 터미널을 엽니다.
 - Linux의 Orca는 단위 테스트로만 확인했고, 실제 Linux 데스크톱에서는 확인하지 않았습니다.
 - "3분 전" 같은 상대 시간은 Orca가 그리므로, 언어 설정과 상관없이 Orca의 화면 언어를 따릅니다.
 - 워커는 자기 환경 그대로 `docker`를 실행합니다. 셸 시작 파일에서만 설정한 `DOCKER_HOST`(rootless Docker, colima
@@ -148,10 +158,14 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
   docker는 찾지 못합니다. Mac에는 `timeout` 명령이 없어서, 멈춘 docker 명령은 20초(Compose 명령은 55초)가 아니라
   ssh 제한인 60초까지 기다립니다.
 
-## v1에 없는 것
+## 아직 지원하지 않는 것
 
-이후 버전에서 하려는 일입니다. 각 항목은 착수 전에 시험으로 확인합니다. Windows의 Orca, 1.4.255보다 오래된
-Orca, 로그인 셸이 tmux나 screen을 자동으로 붙이는 SSH 호스트 감지.
+- **Windows의 Orca.** Windows 기기로 확인할 수 있을 때 만듭니다. 그곳의 Orca CLI는 `orca.cmd`인데, Node는 이를
+  셸 없이 실행하지 못합니다. Shell 명령의 따옴표 규칙도 cmd, PowerShell, WSL마다 다릅니다. 어느 쪽이든 틀리면 값이
+  다른 명령으로 실행될 수 있어서, 시험할 수 있을 때까지 미룹니다.
+- **1.4.255보다 오래된 Orca.** 이 플러그인이 쓰는 패널·설정 API는 Orca 1.4.246부터 있습니다. 하지만 패널
+  컴포넌트와 Orca CLI 동작이 정확히 어느 버전부터 있는지는 문서에 없고, 시험할 옛 Orca도 없었습니다. 그래서 요구
+  버전을 1.4.255로 유지합니다.
 
 ## 개발
 

@@ -10,8 +10,8 @@ import {
   type ProjectDetails, type ResourceDetails,
 } from './panel-model'
 import {
-  REQUEST_TIMEOUT_MS, type ComposeAction, type ContainerAction, type ContainerRow, type FocusContext, type HostId, type HostInfo, type Problem,
-  type ResourceKind, type Result, type Snapshot, type TerminalKind,
+  REQUEST_TIMEOUT_MS, type ComposeAction, type ContainerAction, type ContainerRow, type FocusContext, type HostId, type HostInfo, type Opened,
+  type Problem, type ResourceKind, type Result, type Snapshot, type TerminalKind,
 } from './protocol'
 
 // What the panel shows for the selected host: the last snapshot it applied, the problem of the
@@ -38,8 +38,11 @@ const hostView = atom<HostView | null>(null)
 const selection = atom<string | null>(null)
 const pendingDelete = atom<PendingDelete | null>(null)
 const working = atom(false)
+// An action's problem. A terminal request's also keeps Open anyway, which a startup-shell answer offers: that request
+// again, past the check of the host's login files.
+type ActionProblem = Target & { problem: Problem; openAnyway?: () => Promise<void> }
 // Both clear on the next action or a host change.
-const actionProblem = atom<(Target & { problem: Problem }) | null>(null)
+const actionProblem = atom<ActionProblem | null>(null)
 // "Opened logs in <workspace>." after a Logs, Shell, Pull or Up tab opened in the background; drawn in the language shown.
 const openedNote = atom<(Target & { text: (m: Messages) => string }) | null>(null)
 // Open for the selected container only: it follows the selection and closes when the selection clears.
@@ -235,8 +238,11 @@ async function loadSettings(r: Run): Promise<void> {
   }
 }
 
-// Runs one command for `target`; every Toolbar and Pull button is disabled until it ends. `onOk` sees a success on the same host.
-async function runCommand<T>(target: Target, send: () => Promise<Result<T>>, refreshAfter: boolean, onOk?: (value: T) => void): Promise<void> {
+// Runs one command for `target`; every Toolbar and Pull button is disabled until it ends. `onOk` sees a success on the same host;
+// `openAnyway` goes with a problem on the same host.
+async function runCommand<T>(
+  target: Target, send: () => Promise<Result<T>>, refreshAfter: boolean, onOk?: (value: T) => void, openAnyway?: () => Promise<void>,
+): Promise<void> {
   if (read(working)) return
   const r = run
   set(working, true)
@@ -246,7 +252,7 @@ async function runCommand<T>(target: Target, send: () => Promise<Result<T>>, ref
   if (!alive(r)) return
   set(working, false)
   if (read(selectedHost) !== target.hostId) return
-  if (!answer.ok) set(actionProblem, { ...target, problem: answer.problem })
+  if (!answer.ok) set(actionProblem, { ...target, problem: answer.problem, openAnyway })
   else onOk?.(answer.value)
   if (refreshAfter) await refreshSnapshot()
 }
@@ -255,19 +261,31 @@ function containerAction(hostId: HostId, action: ContainerAction, containerId: s
   return runCommand({ hostId, id: containerId }, () => plugin.request('docker.action', { hostId, action, containerId }, DOCKER_REQUEST), true)
 }
 
-// The tab opens in the background (the plugin API cannot focus it), so the panel says where it is.
+// What Open anyway adds to a terminal request; nothing otherwise.
+type StartupShell = { allowStartupShell?: true }
+
+// Opens a terminal tab for `target`: `send` sends one terminal request, its input fixed when the button was pressed, with
+// `extra` added. The tab opens in the background (the plugin API cannot focus it), so the panel says where it is. Open
+// anyway sends exactly that input again with allowStartupShell, on its own press only.
+function openTab(
+  target: Target, send: (extra: StartupShell) => Promise<Result<Opened>>, note: (m: Messages, workspace: string) => string, extra: StartupShell = {},
+): Promise<void> {
+  return runCommand(target, () => send(extra), false, ({ workspace }) => set(openedNote, { ...target, text: (m) => note(m, workspace) }),
+    () => openTab(target, send, note, { allowStartupShell: true }))
+}
+
 function openTerminal(hostId: HostId, kind: TerminalKind, containerId: string, containerName: string): Promise<void> {
-  const target = { hostId, id: containerId }
-  return runCommand(target, () => plugin.request('docker.openTerminal', { hostId, kind, containerId, containerName }, DOCKER_REQUEST), false,
-    ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedTerminal[kind](workspace) }))
+  const input = { hostId, kind, containerId, containerName }
+  return openTab({ hostId, id: containerId }, (extra) => plugin.request('docker.openTerminal', { ...input, ...extra }, DOCKER_REQUEST),
+    (m, workspace) => m.openedTerminal[kind](workspace))
 }
 
 // Opens `docker pull <ref>` in a terminal on the host, as Shell does; the note and a problem go to `target`
 // (an image tag's card, or the pull row).
 function pullImage(hostId: HostId, targetId: string, ref: string): Promise<void> {
-  const target = { hostId, id: targetId }
-  return runCommand(target, () => plugin.request('docker.pullTerminal', { hostId, ref }, DOCKER_REQUEST), false,
-    ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedPull(ref, workspace) }))
+  const input = { hostId, ref }
+  return openTab({ hostId, id: targetId }, (extra) => plugin.request('docker.pullTerminal', { ...input, ...extra }, DOCKER_REQUEST),
+    (m, workspace) => m.openedPull(ref, workspace))
 }
 
 // Start, Stop, Restart or Down for the whole project, as one compose command in the panel, then the host is read
@@ -285,9 +303,9 @@ function composeUp(hostId: HostId, key: string): Promise<void> {
   const project = projectOf(key)
   if (project === null) return Promise.resolve()
   const { name, memberId } = project
-  const target = { hostId, id: key }
-  return runCommand(target, () => plugin.request('docker.composeUp', { hostId, project: name, memberId }, DOCKER_REQUEST), false,
-    ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedComposeUp(name, workspace) }))
+  const input = { hostId, project: name, memberId }
+  return openTab({ hostId, id: key }, (extra) => plugin.request('docker.composeUp', { ...input, ...extra }, DOCKER_REQUEST),
+    (m, workspace) => m.openedComposeUp(name, workspace))
 }
 
 // The same rule the worker applies; a refused name stays in the field with an error under it, and nothing is sent.
@@ -301,9 +319,13 @@ function pullByName(hostId: HostId): void {
   void pullImage(hostId, PULL_ROW, ref)
 }
 
+// A new name also drops the pull row's startup-shell warning: its Open anyway would pull the name pressed before.
 function changePullText(text: string): void {
+  const changed = text !== read(pullText)
   set(pullText, text)
   set(pullInvalid, false)
+  const problem = read(actionProblem)
+  if (changed && problem !== null && problem.id === PULL_ROW && problem.problem.kind === 'startup-shell') set(actionProblem, null)
 }
 
 // Never forced: Docker refuses an item in use, and its answer shows on the card. A delete that went through
@@ -511,6 +533,28 @@ function problemCallout(problem: Problem, tone: Tone, key: string): OrcaNode {
   )
 }
 
+// An action's problem on its card (or under the pull row). A startup-shell answer is a warning instead, naming the login
+// files that may start tmux, screen or byobu, with Open anyway. No command runs while it shows: each one clears it first.
+function actionCallout(owned: ActionProblem | null, key: string): OrcaNode {
+  if (owned === null) return null
+  const { problem, openAnyway } = owned
+  if (problem.kind !== 'startup-shell') return problemCallout(problem, 'danger', key)
+  const lang = uiLang()
+  const m = messages[lang]
+  return (
+    <Callout key={key} tone="warning" title={problemCopy(problem, lang).title}>
+      <Stack gap="sm">
+        <Text>{m.startupShellWarning(problem.message)}</Text>
+        {openAnyway === undefined ? null : (
+          <Row gap="xs">
+            <Button key="open-anyway" size="sm" onPress={() => void openAnyway()}>{m.openAnyway}</Button>
+          </Row>
+        )}
+      </Stack>
+    </Callout>
+  )
+}
+
 // A question, problem or note for another item (or host) is not drawn here.
 const ownedBy = (hostId: HostId, id: string) => <T extends Target>(value: T | null): T | null =>
   value !== null && value.hostId === hostId && value.id === id ? value : null
@@ -546,7 +590,7 @@ function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
     set(pendingDelete, { hostId: view.hostId, id: container.id, name: container.name, kind: 'container', ref: container.id })
   const own = ownedBy(view.hostId, container.id)
   const pending = own(read(pendingDelete))
-  const problem = own(read(actionProblem))?.problem ?? null
+  const problem = own(read(actionProblem))
   const opened = noteText(own(read(openedNote)), m)
   return (
     <Card key="details" title={container.name} description={container.state}>
@@ -565,7 +609,7 @@ function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
         </Row>
         {opened === null ? null : <Text muted size="sm">{opened}</Text>}
         {pending === null ? null : deleteQuestion(pending, m.removeContainer, busy)}
-        {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
+        {actionCallout(problem, 'action-problem')}
       </Stack>
     </Card>
   )
@@ -579,7 +623,7 @@ function resourceCard(view: HostView, details: ResourceDetails): OrcaNode {
   const askDelete = () => set(pendingDelete, { hostId: view.hostId, id: key, name: title, kind, ref: removeRef })
   const own = ownedBy(view.hostId, key)
   const pending = own(read(pendingDelete))
-  const problem = own(read(actionProblem))?.problem ?? null
+  const problem = own(read(actionProblem))
   const opened = noteText(own(read(openedNote)), m)
   return (
     <Card key="details" title={title}>
@@ -598,7 +642,7 @@ function resourceCard(view: HostView, details: ResourceDetails): OrcaNode {
         {removeBlocked === null ? null : <Text key="delete-blocked" muted size="sm">{removeBlocked}</Text>}
         {opened === null ? null : <Text muted size="sm">{opened}</Text>}
         {pending === null ? null : deleteQuestion(pending, details.removeText, busy)}
-        {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
+        {actionCallout(problem, 'action-problem')}
       </Stack>
     </Card>
   )
@@ -631,7 +675,7 @@ function projectCard(view: HostView, project: ProjectDetails): OrcaNode {
   const askDown = () => set(pendingDelete, { hostId: view.hostId, id: key, name, kind: 'project', ref: name })
   const own = ownedBy(view.hostId, key)
   const pending = own(read(pendingDelete))
-  const problem = own(read(actionProblem))?.problem ?? null
+  const problem = own(read(actionProblem))
   const opened = noteText(own(read(openedNote)), m)
   return (
     <Card key="details" title={name}>
@@ -649,7 +693,7 @@ function projectCard(view: HostView, project: ProjectDetails): OrcaNode {
         </Row>
         {opened === null ? null : <Text muted size="sm">{opened}</Text>}
         {pending === null ? null : downQuestion(name, busy)}
-        {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
+        {actionCallout(problem, 'action-problem')}
       </Stack>
     </Card>
   )
@@ -741,7 +785,7 @@ function pullRow(view: HostView): OrcaNode {
   const text = read(pullText)
   const invalid = read(pullInvalid)
   const own = ownedBy(view.hostId, PULL_ROW)
-  const problem = own(read(actionProblem))?.problem ?? null
+  const problem = own(read(actionProblem))
   const opened = noteText(own(read(openedNote)), m)
   return (
     <Stack key="pull-row" gap="xs">
@@ -754,7 +798,7 @@ function pullRow(view: HostView): OrcaNode {
       </Row>
       {invalid ? <Text key="pull-error" tone="danger" size="sm">{m.notAnImage}</Text> : null}
       {opened === null ? null : <Text key="pull-opened" muted size="sm">{opened}</Text>}
-      {problem === null ? null : problemCallout(problem, 'danger', 'pull-problem')}
+      {actionCallout(problem, 'pull-problem')}
     </Stack>
   )
 }

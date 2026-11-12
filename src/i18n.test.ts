@@ -95,6 +95,16 @@ test('the en counts use the right plural', () => {
   assert.equal(messages.ko.runningOfTotal(1, 2), '2개 중 1개 실행 중')
 })
 
+test('the startup-shell warning copy', () => {
+  const files = '.bashrc, .config/fish/config.fish'
+  assert.equal(messages.en.startupShellWarning(files),
+    "This host's login files (.bashrc, .config/fish/config.fish) may start tmux, screen or byobu. The command could be typed into that session.")
+  assert.equal(messages.ko.startupShellWarning(files),
+    '이 호스트의 로그인 파일(.bashrc, .config/fish/config.fish)이 tmux, screen 또는 byobu를 띄울 수 있습니다. 명령이 그 세션에 입력될 수 있습니다.')
+  assert.equal(messages.en.openAnyway, 'Open anyway')
+  assert.equal(messages.ko.openAnyway, '그래도 열기')
+})
+
 test('the Compose project copy', () => {
   assert.equal(messages.en.downQuestion('shop'), 'Down shop: stops and removes its containers and networks. Volumes and images are kept.')
   assert.equal(messages.ko.downQuestion('shop'), 'shop Down: 프로젝트의 컨테이너를 중지하고, 컨테이너와 네트워크를 삭제합니다. 볼륨과 이미지는 그대로 둡니다.')

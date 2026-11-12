@@ -130,7 +130,7 @@ test('log text strips ANSI escapes', () => {
 })
 
 test('problem copy', () => {
-  const expected: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed'>, [string, string]> = {
+  const expected: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed' | 'startup-shell'>, [string, string]> = {
     unsupported: ['Not supported here', 'This version supports Orca on macOS or Linux, with Linux or macOS SSH hosts.'],
     unreachable: ['Host unreachable', 'Orca could not reach this host. Check its SSH connection in Orca.'],
     'no-workspace': ['No workspace on this host', 'Open a workspace on this host in Orca first.'],
@@ -148,6 +148,9 @@ test('problem copy', () => {
   assert.deepEqual(problemCopy({ kind: 'failed', message: 'boom' }), { title: 'Command failed', description: 'boom' })
   const sshMessage = 'No ssh host named "GPU1" on this Mac. Add a "Host GPU1" entry with key login to ~/.ssh/config.'
   assert.deepEqual(problemCopy({ kind: 'ssh-failed', message: sshMessage }), { title: 'SSH connection failed', description: sshMessage })
+  // The worker's message is the list of login files.
+  const files = '.bashrc, .config/fish/config.fish'
+  assert.deepEqual(problemCopy({ kind: 'startup-shell', message: files }), { title: 'This host may start tmux, screen or byobu', description: files })
 })
 
 test('rejections become failed problems', () => {
@@ -478,8 +481,8 @@ test('shownKey: whether the trees draw an item for this filter', () => {
 })
 
 // Korean: the same functions with `ko`; what Docker, ssh and the worker say stays as it came.
-test('problem copy in Korean: fixed titles and descriptions, the message as it came for invalid, failed and ssh-failed', () => {
-  const expected: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed'>, [string, string]> = {
+test('problem copy in Korean: fixed titles and descriptions, the message as it came for invalid, failed, ssh-failed and startup-shell', () => {
+  const expected: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed' | 'startup-shell'>, [string, string]> = {
     unsupported: ['여기서는 지원하지 않습니다', '이 버전은 macOS·Linux의 Orca와 Linux·macOS SSH 호스트를 지원합니다.'],
     unreachable: ['호스트에 연결할 수 없습니다', 'Orca가 이 호스트에 연결하지 못했습니다. Orca에서 이 호스트의 SSH 연결을 확인하세요.'],
     'no-workspace': ['이 호스트에 워크스페이스가 없습니다', '먼저 Orca에서 이 호스트의 워크스페이스를 여세요.'],
@@ -497,6 +500,8 @@ test('problem copy in Korean: fixed titles and descriptions, the message as it c
   assert.deepEqual(problemCopy({ kind: 'failed', message: 'boom' }, 'ko'), { title: '명령이 실패했습니다', description: 'boom' })
   const sshMessage = 'No ssh host named "GPU1" on this Mac. Add a "Host GPU1" entry with key login to ~/.ssh/config.'
   assert.deepEqual(problemCopy({ kind: 'ssh-failed', message: sshMessage }, 'ko'), { title: 'SSH 연결에 실패했습니다', description: sshMessage })
+  const files = '.bashrc, .config/fish/config.fish'
+  assert.deepEqual(problemCopy({ kind: 'startup-shell', message: files }, 'ko'), { title: '이 호스트는 tmux, screen 또는 byobu를 띄울 수 있습니다', description: files })
   // English stays the default, and `en` asks for it.
   assert.deepEqual(problemCopy({ kind: 'timeout', message: '' }, 'en'), { title: 'Timed out', description: 'Docker did not answer in time.' })
 })

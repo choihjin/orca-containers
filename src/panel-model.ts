@@ -89,11 +89,14 @@ export function dueForRefresh(now: number, lastAt: number | null, visible: boole
   return lastAt === null || now - lastAt >= intervalMs
 }
 
-// The message of an invalid, failed or ssh-failed problem is what the daemon, ssh or the worker said, in English.
+// The message of an invalid, failed or ssh-failed problem is what the daemon, ssh or the worker said, in English;
+// a startup-shell problem's message is the list of the host's login files that may start tmux, screen or byobu.
 export function problemCopy(problem: Problem, lang: Lang = 'en'): { title: string; description: string } {
   const copy = messages[lang].problems
   const { kind } = problem
-  if (kind === 'invalid' || kind === 'failed' || kind === 'ssh-failed') return { title: copy[kind].title, description: problem.message }
+  if (kind === 'invalid' || kind === 'failed' || kind === 'ssh-failed' || kind === 'startup-shell') {
+    return { title: copy[kind].title, description: problem.message }
+  }
   return { ...copy[kind] }
 }
 

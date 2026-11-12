@@ -1,5 +1,5 @@
 // The panel's own words, in English and Korean. What Docker, ssh and the worker say (the message of an
-// invalid, failed or ssh-failed problem, names, statuses) is shown as it comes and is not here.
+// invalid, failed, ssh-failed or startup-shell problem, names, statuses) is shown as it comes and is not here.
 import type { LocalHostLabel } from './platform'
 import type { ProblemKind, ResourceKind, TerminalKind } from './protocol'
 
@@ -14,7 +14,8 @@ export function resolveLang(setting: unknown, locale: string): Lang {
 }
 
 // Problems whose description is the message that came with them; only their title is the panel's.
-type MessageKind = 'invalid' | 'failed' | 'ssh-failed'
+// startup-shell: the message lists the host's login files that may start tmux, screen or byobu.
+type MessageKind = 'invalid' | 'failed' | 'ssh-failed' | 'startup-shell'
 type SectionId = 'containers' | 'images' | 'volumes' | 'networks'
 
 export type Messages = {
@@ -88,6 +89,10 @@ export type Messages = {
   // The pull row.
   imageToPull: string
   notAnImage: string
+  // A startup-shell answer on the card of a terminal request: the warning with the worker's file list, and the button
+  // that sends the same request again past the check.
+  startupShellWarning: (files: string) => string
+  openAnyway: string
   problems: Record<Exclude<ProblemKind, MessageKind>, { title: string; description: string }> & Record<MessageKind, { title: string }>
 }
 
@@ -155,6 +160,9 @@ const en: Messages = {
   noLogs: 'No log output',
   imageToPull: 'Image to pull',
   notAnImage: 'Not an image name. Use one like nginx:latest or ghcr.io/org/app:1.2.',
+  startupShellWarning: (files) =>
+    `This host's login files (${files}) may start tmux, screen or byobu. The command could be typed into that session.`,
+  openAnyway: 'Open anyway',
   problems: {
     unsupported: { title: 'Not supported here', description: 'This version supports Orca on macOS or Linux, with Linux or macOS SSH hosts.' },
     unreachable: { title: 'Host unreachable', description: 'Orca could not reach this host. Check its SSH connection in Orca.' },
@@ -168,6 +176,7 @@ const en: Messages = {
     invalid: { title: 'Invalid request' },
     failed: { title: 'Command failed' },
     'ssh-failed': { title: 'SSH connection failed' },
+    'startup-shell': { title: 'This host may start tmux, screen or byobu' },
   },
 }
 
@@ -236,6 +245,8 @@ const ko: Messages = {
   noLogs: '로그가 없습니다',
   imageToPull: 'Pull할 이미지',
   notAnImage: '이미지 이름이 아닙니다. nginx:latest나 ghcr.io/org/app:1.2처럼 입력하세요.',
+  startupShellWarning: (files) => `이 호스트의 로그인 파일(${files})이 tmux, screen 또는 byobu를 띄울 수 있습니다. 명령이 그 세션에 입력될 수 있습니다.`,
+  openAnyway: '그래도 열기',
   problems: {
     unsupported: { title: '여기서는 지원하지 않습니다', description: '이 버전은 macOS·Linux의 Orca와 Linux·macOS SSH 호스트를 지원합니다.' },
     unreachable: { title: '호스트에 연결할 수 없습니다', description: 'Orca가 이 호스트에 연결하지 못했습니다. Orca에서 이 호스트의 SSH 연결을 확인하세요.' },
@@ -249,6 +260,7 @@ const ko: Messages = {
     invalid: { title: '잘못된 요청입니다' },
     failed: { title: '명령이 실패했습니다' },
     'ssh-failed': { title: 'SSH 연결에 실패했습니다' },
+    'startup-shell': { title: '이 호스트는 tmux, screen 또는 byobu를 띄울 수 있습니다' },
   },
 }
 

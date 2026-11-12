@@ -98,10 +98,10 @@ In Orca, open **Settings → Plugins**, choose **Add plugin → From a Git URL�
 URL with a version tag and install:
 
 ```text
-https://github.com/choihjin/orca-containers#v0.4.0
+https://github.com/choihjin/orca-containers#v0.5.0
 ```
 
-Or from a terminal: `orca plugin install choihjin/orca-containers@v0.4.0` (on Linux, `orca-ide plugin install …`).
+Or from a terminal: `orca plugin install choihjin/orca-containers@v0.5.0` (on Linux, `orca-ide plugin install …`).
 
 Orca shows what the plugin asks for before it runs anything. Review it, then enable it.
 
@@ -147,8 +147,18 @@ terminal, Pull and Compose Up) go through the Orca command-line tool.
 - An answer from an SSH host larger than 64 MiB is not shown; the panel says "List too long".
 - The log view cuts a line after 500 characters and shows only the newest lines that fit in 15,000
   characters. Open in terminal shows them whole.
-- If an SSH host's login shell startup files start tmux or screen automatically, the docker command of
-  Shell, Open in terminal, Pull or Compose Up may be typed into that program.
+- Orca types a terminal's command into whatever the host's login shell starts, so a tmux, screen or byobu
+  session there could receive it. Before Shell, Open in terminal, Pull or Compose Up opens a terminal on an SSH
+  host, the plugin reads the login files in your home folder on that host (`.bashrc`, `.bash_profile`,
+  `.bash_login`, `.profile`, `.zshrc`, `.zprofile`, `.zlogin`, `.zshenv`, `.config/fish/config.fish`) without
+  running them. If a line names tmux, screen or byobu, nothing opens and the panel shows a warning with those
+  files; **Open anyway** opens the terminal as asked. This Mac is not checked. The check is a guess from the file
+  text, so it can miss a host or warn about one wrongly:
+  - Text after `#` is ignored as a comment, so a `#` inside quotes hides the rest of that line.
+  - A line that only mentions tmux is flagged too, for example oh-my-zsh's `plugins=(... tmux)` line, even when
+    its autostart is off.
+  - Files sourced from other places and the files in /etc are not read.
+  - If reading the files fails (an ssh error or timeout), nothing is blocked; the terminal opens as before.
 - Orca on Linux was tested with unit tests only, not on a real Linux desktop.
 - Relative times ("3 minutes ago") are drawn by Orca in Orca's own UI language, whatever the Language setting says.
 - The worker runs `docker` with its own environment: a `DOCKER_HOST` set only in your shell startup files
@@ -158,10 +168,15 @@ terminal, Pull and Compose Up) go through the Orca command-line tool.
   installed elsewhere is not found. A Mac host has no `timeout` command, so one stuck docker command waits for
   the 60 s ssh limit instead of 20 s (55 s for a Compose command).
 
-## Not in v1
+## Not supported yet
 
-Planned for later, each to be verified before work starts: Orca on Windows; Orca older than 1.4.255; detecting
-SSH hosts whose login shell starts tmux or screen automatically.
+- **Orca on Windows.** Not built yet, because it needs a Windows machine to verify. Orca's CLI there is
+  `orca.cmd`, which Node cannot start without a shell. The Shell command's quoting also differs between cmd,
+  PowerShell and WSL. Getting either wrong could let a value become a second command, so this waits until it can
+  be tested.
+- **Orca older than 1.4.255.** The panel and settings APIs it uses exist from Orca 1.4.246. The exact versions of
+  the panel components and Orca CLI behaviours it relies on are not documented, and no older Orca was available
+  to test. So the requirement stays at 1.4.255.
 
 ## Development
 

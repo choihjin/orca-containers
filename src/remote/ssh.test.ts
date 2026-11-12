@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { assert, describe, test } from 'orca/testing'
 import { actionCommand, composeCommand, composeLabelsCommand, InvalidInputError, logsCommand, removeCommand, SNAPSHOT_COMMANDS } from '../docker/commands'
 import type { CommandResult } from '../docker/parse'
-import { MARK, sshScript } from './script'
+import { MARK, sshScript, startupScript } from './script'
 import {
   createSshRunner, kernelKey, nodeSshExec, SSH_KILL_GRACE_MS, SSH_PATH, SSH_RUN_TIMEOUT_MS, sshArgs, type KeyValueStore, type SshExec,
 } from './ssh'
@@ -62,6 +62,10 @@ const completeFor = (nonce: string, ...results: CommandResult[]) => completeOn('
 const complete = (...results: CommandResult[]) => completeFor(NONCE, ...results)
 const nonceOf = (call: Call): string => /^N=([0-9a-f]{8})$/m.exec(call.input)?.[1] ?? ''
 const OPTS = { deadline: 100_000 }
+const kindOf = async (answer: Promise<{ ok: boolean; problem?: { kind: string } }>): Promise<string> => {
+  const r = await answer
+  return r.ok ? 'ok' : r.problem?.kind ?? ''
+}
 
 const invalidInput = (error: unknown): boolean => error instanceof InvalidInputError
 
@@ -442,6 +446,59 @@ describe('ssh runner', () => {
     assert.equal(late.ok ? 'ok' : late.problem.kind, 'timeout')
     const logs = await setup(() => ({ code: 255, stdout: dropped })).runner.run(ENV, [logsCommand(ID)], OPTS)
     assert.equal(logs.ok ? 'ok' : logs.problem.kind, 'failed')
+  })
+})
+
+// The scan of the login startup files: the same ssh run, with the startup section read into file names.
+describe('ssh runner: startup scan', () => {
+  const startup = (...lines: string[]): CommandResult => ({ name: 'startup', code: 0, lines })
+
+  test('spawns SSH_PATH with the fixed argv and the scan script on stdin, within the run limits', async () => {
+    const t = setup(() => ({ stdout: complete(startup()) }), { now: () => 1_000 })
+    const ctl = new AbortController()
+    await t.runner.startupScan(ENV, { deadline: 100_000, signal: ctl.signal })
+    await t.runner.startupScan(ENV, { deadline: 6_000 })
+    assert.equal(t.calls[0]?.file, SSH_PATH)
+    assert.deepEqual(t.calls[0]?.args, sshArgs(ENV))
+    assert.equal(t.calls[0]?.input, startupScript(NONCE))
+    assert.deepEqual(t.calls.map((c) => c.timeoutMs), [SSH_RUN_TIMEOUT_MS, 5_000])
+    assert.equal(t.calls[0]?.signal, ctl.signal)
+  })
+
+  test('reads the startup section into the files\' paths in $HOME, and stores the kernel', async () => {
+    const t = setup(() => ({ stdout: completeOn('Darwin', NONCE, startup('.bash_profile', '.config/fish/config.fish')) }))
+    assert.deepEqual(await t.runner.startupScan(ENV, OPTS), { ok: true, value: ['.bash_profile', '.config/fish/config.fish'] })
+    assert.equal(t.data.get(kernelKey(ENV)), 'Darwin')
+    const none = setup(() => ({ stdout: complete(startup()) }))
+    assert.deepEqual(await none.runner.startupScan(ENV, OPTS), { ok: true, value: [] })
+  })
+
+  test('keeps only the scanned files\' paths, once each, in the scan order', async () => {
+    const lines = ['.config/fish/config.fish', '.zshrc', 'junk', '.bashrc', '.zshrc', 'config.fish', '/home/u/.profile', ' .profile', '', '$(id)']
+    const t = setup(() => ({ stdout: complete(startup(...lines)) }))
+    assert.deepEqual(await t.runner.startupScan(ENV, OPTS), { ok: true, value: ['.bashrc', '.zshrc', '.config/fish/config.fish'] })
+  })
+
+  test('a finished run with no startup section of code 0 answers null: the scan gave no answer', async () => {
+    for (const stdout of [complete(), complete({ name: 'startup', code: 1, lines: ['.bashrc'] }), complete({ name: 'ps', code: 0, lines: ['.bashrc'] })]) {
+      assert.deepEqual(await setup(() => ({ stdout })).runner.startupScan(ENV, OPTS), { ok: true, value: null }, stdout)
+    }
+  })
+
+  test('answers what a run would when ssh fails, the kernel is not supported or the run is cut off; never unknown-result', async () => {
+    const failed = await setup(() => ({ code: 255, stderr: 'ssh: Could not resolve hostname gpu1: nodename nor servname provided' }))
+      .runner.startupScan(ENV, OPTS)
+    assert.deepEqual(failed, { ok: false, problem: { kind: 'ssh-failed',
+      message: 'No ssh host named "GPU1" on this Mac. Add a "Host GPU1" entry with key login to ~/.ssh/config.' } })
+    const other = setup(() => ({ stdout: output(marker('READY', 'FreeBSD')) }))
+    assert.equal(await kindOf(other.runner.startupScan(ENV, OPTS)), 'unsupported')
+    assert.equal(other.data.get(kernelKey(ENV)), 'FreeBSD')
+    assert.equal(await kindOf(setup(() => ({ code: null, timedOut: true, stdout: output(READY, BEGIN) })).runner.startupScan(ENV, OPTS)), 'timeout')
+    assert.equal(await kindOf(setup(() => ({ code: 255, stdout: output(READY, BEGIN, marker('SEC', 'startup')) })).runner.startupScan(ENV, OPTS)), 'failed')
+    assert.equal(await kindOf(setup(() => ({ code: null, overflow: true, stdout: output(READY) })).runner.startupScan(ENV, OPTS)), 'truncated')
+    const t = setup(() => ({ stdout: complete() }))
+    assert.equal(await kindOf(t.runner.startupScan('-oProxyCommand=x', OPTS)), 'ssh-failed')
+    assert.equal(t.calls.length, 0)
   })
 })
 

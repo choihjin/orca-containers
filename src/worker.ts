@@ -30,6 +30,11 @@ const isString = (v: unknown): v is string => typeof v === 'string'
 const isAction = (v: unknown): v is ContainerAction => v === 'start' || v === 'stop' || v === 'restart' || v === 'remove'
 const isKind = (v: unknown): v is TerminalKind => v === 'logs' || v === 'shell'
 const isResourceKind = (v: unknown): v is ResourceKind => v === 'image' || v === 'volume' || v === 'network'
+// The terminal requests' optional allowStartupShell: absent, or a boolean. null for any other value.
+function startupFlag(o: Record<string, unknown>): { allowStartupShell?: boolean } | null {
+  if (o.allowStartupShell === undefined) return {}
+  return typeof o.allowStartupShell === 'boolean' ? { allowStartupShell: o.allowStartupShell } : null
+}
 
 // Answers must be plain JSON: an undefined field would make the host refuse the answer.
 const plain = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
@@ -118,6 +123,7 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
     const obj = (raw: unknown): Record<string, unknown> | null => (isObject(raw) ? raw : null)
     const NOT_OBJECT = 'The request must be an object.'
     const BAD_HOST = 'hostId must be "local" or "ssh:<name>".'
+    const BAD_FLAG = 'allowStartupShell must be a boolean.'
 
     register('hosts.list', (raw) => {
       const o = obj(raw)
@@ -166,9 +172,11 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
       if (!isKind(o.kind)) return { error: 'kind must be logs or shell.' }
       if (!isString(o.containerId)) return { error: 'containerId must be a string.' }
       if (!isString(o.containerName)) return { error: 'containerName must be a string.' }
-      return { input: { hostId: o.hostId, kind: o.kind, containerId: o.containerId, containerName: o.containerName } }
+      const flag = startupFlag(o)
+      if (!flag) return { error: BAD_FLAG }
+      return { input: { hostId: o.hostId, kind: o.kind, containerId: o.containerId, containerName: o.containerName, ...flag } }
     }, async (input, { service }, options) =>
-      service.openTerminal(input.hostId, input.kind, input.containerId, input.containerName, await readFocus(), options))
+      service.openTerminal(input.hostId, input.kind, input.containerId, input.containerName, await readFocus(), options, input.allowStartupShell === true))
 
     // Only the shape here; the service checks `ref` against the kind's own rule.
     register('docker.removeResource', (raw) => {
@@ -184,9 +192,11 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
       const o = obj(raw)
       if (!o) return { error: NOT_OBJECT }
       if (!isHostId(o.hostId)) return { error: BAD_HOST }
-      return isString(o.ref) ? { input: { hostId: o.hostId, ref: o.ref } } : { error: 'ref must be a string.' }
+      if (!isString(o.ref)) return { error: 'ref must be a string.' }
+      const flag = startupFlag(o)
+      return flag ? { input: { hostId: o.hostId, ref: o.ref, ...flag } } : { error: BAD_FLAG }
     }, async (input, { service }, options) =>
-      service.pullTerminal(input.hostId, input.ref, await readFocus(), options))
+      service.pullTerminal(input.hostId, input.ref, await readFocus(), options, input.allowStartupShell === true))
 
     // Only the shape here; the service checks the project name and the member id.
     register('docker.composeAction', (raw) => {
@@ -205,9 +215,11 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
       if (!o) return { error: NOT_OBJECT }
       if (!isHostId(o.hostId)) return { error: BAD_HOST }
       if (!isString(o.project)) return { error: 'project must be a string.' }
-      return isString(o.memberId) ? { input: { hostId: o.hostId, project: o.project, memberId: o.memberId } } : { error: 'memberId must be a string.' }
+      if (!isString(o.memberId)) return { error: 'memberId must be a string.' }
+      const flag = startupFlag(o)
+      return flag ? { input: { hostId: o.hostId, project: o.project, memberId: o.memberId, ...flag } } : { error: BAD_FLAG }
     }, async (input, { service }, options) =>
-      service.composeUp(input.hostId, input.project, input.memberId, await readFocus(), options))
+      service.composeUp(input.hostId, input.project, input.memberId, await readFocus(), options, input.allowStartupShell === true))
   }
 
   // Nothing to close (no terminal is kept open): the requests still running are stopped, and new ones answer timeout.

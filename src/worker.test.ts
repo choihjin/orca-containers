@@ -5,7 +5,7 @@ import { FakeCli } from './remote/fake-cli'
 import { CliError } from './remote/orca-cli'
 import type { LocalRunner } from './local/runner'
 import type { CommandResult } from './docker/parse'
-import { MARK } from './remote/script'
+import { MARK, startupScript } from './remote/script'
 import { SSH_PATH, type SshExec, type SshExecResult } from './remote/ssh'
 
 const versionLine = JSON.stringify({ Server: { Version: '27.0.1' } })
@@ -367,13 +367,13 @@ test('answers docker.pullTerminal by opening a local terminal with docker pull a
   assert.deepEqual(w.refusals, [])
 })
 
-test('an SSH pull opens an Orca terminal on that host after the kernel check, and runs no docker command', async () => {
+test('an SSH pull opens an Orca terminal on that host after the kernel check and startup scan, and runs no docker command', async () => {
   const s = setup({}, sshHost)
   const w = await mountWorker(s.module, { host: s.host })
   const r = await w.request('docker.pullTerminal', { hostId: 'ssh:GPU1', ref: 'ghcr.io/org/app:1.2' })
   assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
   assert.equal(s.execs.length, 1)
-  assert.equal(s.execs[0]!.input.includes('SEC_'), false, s.execs[0]!.input)
+  assert.equal(s.execs[0]!.input, startupScript('deadbeef'))
   const created = s.cli.calls.filter((c) => c.method === 'createTerminal')
   assert.deepEqual(created, [{
     method: 'createTerminal', environment: 'GPU1', worktreePath: '/home/u/proj', title: 'pull: ghcr.io/org/app:1.2',
@@ -449,7 +449,7 @@ test('answers docker.composeUp by opening a local terminal with docker compose .
   assert.deepEqual(w.refusals, [])
 })
 
-test('an SSH compose up checks the kernel, looks up the labels, then opens an Orca terminal on that host', async () => {
+test('an SSH compose up checks the kernel and scans, looks up the labels, then opens an Orca terminal on that host', async () => {
   const s = setup({}, sshHost)
   const w = await mountWorker(s.module, { host: s.host })
   s.ssh.answer = async (call) => ({
@@ -458,7 +458,7 @@ test('an SSH compose up checks the kernel, looks up the labels, then opens an Or
   const r = await w.request('docker.composeUp', { hostId: 'ssh:GPU1', project: 'shop', memberId: ID })
   assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
   assert.equal(s.execs.length, 2)
-  assert.equal(s.execs[0]!.input.includes('SEC_'), false, s.execs[0]!.input)
+  assert.equal(s.execs[0]!.input, startupScript('deadbeef'))
   assert.ok(s.execs[1]!.input.includes('"$D" inspect'), s.execs[1]!.input)
   assert.deepEqual(s.cli.calls.filter((c) => c.method === 'createTerminal'), [{
     method: 'createTerminal', environment: 'GPU1', worktreePath: '/home/u/proj', title: 'compose up: shop',
@@ -512,6 +512,64 @@ test('compose requests with a bad shape or a bad value are invalid and run or op
   assert.deepEqual(w.refusals, [])
 })
 
+// The three terminal requests, on this Mac and on SSH host GPU1.
+const TERMINAL_REQUESTS = [
+  ['docker.openTerminal', { kind: 'shell', containerId: ID, containerName: 'web' }],
+  ['docker.openTerminal', { kind: 'logs', containerId: ID, containerName: 'web' }],
+  ['docker.pullTerminal', { ref: 'nginx:1.27' }],
+  ['docker.composeUp', { project: 'shop', memberId: ID }],
+] as const
+
+test('the terminal requests take allowStartupShell only as an optional boolean', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  for (const [name, input] of TERMINAL_REQUESTS) {
+    for (const hostId of ['local', 'ssh:GPU1']) {
+      for (const allowStartupShell of ['true', 1, 0, null, {}, [true]]) {
+        const r = await w.request(name as 'docker.composeUp', { hostId, ...input, allowStartupShell } as never)
+        assert.deepEqual(r, { ok: false, problem: { kind: 'invalid', message: 'allowStartupShell must be a boolean.' } }, `${name} ${JSON.stringify(allowStartupShell)}`)
+      }
+    }
+  }
+  assert.equal(s.runs.length, 0)
+  assert.equal(s.execs.length, 0)
+  assert.deepEqual(s.host.callsOf('terminal.create'), [])
+  assert.equal(s.cli.calls.some((c) => c.method === 'createTerminal'), false)
+  // On this Mac a flag of either value is accepted, and nothing is scanned.
+  for (const [name, input] of TERMINAL_REQUESTS) {
+    for (const allowStartupShell of [true, false]) {
+      const r = await w.request(name as 'docker.composeUp', { hostId: 'local', ...input, allowStartupShell } as never)
+      assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } }, `${name} ${allowStartupShell}`)
+    }
+  }
+  assert.equal(s.execs.length, 0)
+  assert.deepEqual(w.refusals, [])
+})
+
+// Through the real ssh runner: the remote startup section names .bashrc and fish's file, by their paths in $HOME.
+test('an SSH terminal request whose login files start tmux answers startup-shell and opens nothing; with allowStartupShell it opens', async () => {
+  for (const [name, input] of TERMINAL_REQUESTS) {
+    const s = setup({}, sshHost)
+    const w = await mountWorker(s.module, { host: s.host })
+    s.ssh.answer = async (call) => ({
+      code: 0, timedOut: false, stderr: '',
+      stdout: remoteOutput(call.input, { startup: { code: 0, lines: ['.bashrc', '.config/fish/config.fish'] }, labels: { code: 0, lines: [LABELS] } }),
+    })
+    const blocked = await w.request(name as 'docker.composeUp', { hostId: 'ssh:GPU1', ...input } as never)
+    assert.deepEqual(blocked, { ok: false, problem: { kind: 'startup-shell', message: '.bashrc, .config/fish/config.fish' } }, name)
+    assert.deepEqual(s.execs.map((e) => e.input), [startupScript('deadbeef')], name)
+    assert.equal(s.cli.calls.some((c) => c.method === 'createTerminal'), false, name)
+    assert.deepEqual(await w.request(name as 'docker.composeUp', { hostId: 'ssh:GPU1', ...input, allowStartupShell: false } as never), blocked, name)
+    const opened = await w.request(name as 'docker.composeUp', { hostId: 'ssh:GPU1', ...input, allowStartupShell: true } as never)
+    assert.deepEqual(opened, { ok: true, value: { opened: true, workspace: 'proj' } }, name)
+    // The kernel is stored by now: no scan and no check, only Up's labels lookup.
+    assert.equal(s.execs.slice(2).some((e) => e.input.includes('startup')), false, name)
+    assert.equal(s.execs.length, name === 'docker.composeUp' ? 3 : 2, name)
+    assert.equal(s.cli.calls.filter((c) => c.method === 'createTerminal').length, 1, name)
+    assert.deepEqual(w.refusals, [])
+  }
+})
+
 test('deactivate does not create the dependencies', async () => {
   const s = setup()
   const w = await mountWorker(s.module, { host: s.host })
@@ -553,20 +611,21 @@ test('an SSH snapshot, action and logs open, type into, read or close no termina
   assert.deepEqual(w.refusals, [])
 })
 
-// The empty run goes through the real ssh runner: READY with the kernel, BEGIN and END, no section, ok([]).
-test('an SSH Shell checks a kernel it does not know with one empty ssh run, then opens an Orca terminal on that host', async () => {
+// The scan run goes through the real ssh runner: READY with the kernel, BEGIN, an empty startup section, END.
+test('an SSH Shell checks a kernel it does not know with the startup scan run, then opens an Orca terminal on that host', async () => {
   const s = setup({}, sshHost)
   const w = await mountWorker(s.module, { host: s.host })
   const r = await w.request('docker.openTerminal', { hostId: 'ssh:GPU1', kind: 'shell', containerId: ID, containerName: 'web' })
   assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
   assert.equal(s.execs.length, 1)
   assert.deepEqual(s.execs[0]!.args.slice(-3), ['--', 'GPU1', 'sh -s'])
-  assert.equal(s.execs[0]!.input.includes('SEC_'), false, s.execs[0]!.input)
+  assert.equal(s.execs[0]!.input, startupScript('deadbeef'))
   assert.equal(s.cli.calls.filter((c) => c.method === 'createTerminal').length, 1)
   assert.deepEqual(s.cli.calls.filter((c) => c.method === 'switchTo').map((c) => c.environment), ['GPU1'])
-  // The run stored the kernel: the next terminal on that host needs no check.
+  // The run stored the kernel: the next terminal on that host only scans, in its own small run.
   await w.request('docker.openTerminal', { hostId: 'ssh:GPU1', kind: 'logs', containerId: ID, containerName: 'web' })
-  assert.equal(s.execs.length, 1)
+  assert.equal(s.execs.length, 2)
+  assert.equal(s.execs[1]!.input, startupScript('deadbeef'))
   assert.equal(s.cli.calls.filter((c) => c.method === 'createTerminal').length, 2)
 })
 

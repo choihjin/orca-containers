@@ -7,7 +7,7 @@ import { actionCommand, composeCommand, composeLabelsCommand, logsCommand, SNAPS
 import { shellCommand } from '../platform'
 import { extractRun, readyInfo } from './markers'
 import * as script from './script'
-import { MARK, macTerminalArgv, REMOTE_DOCKER_CANDIDATES, sshScript } from './script'
+import { MARK, macTerminalArgv, REMOTE_DOCKER_CANDIDATES, sshScript, STARTUP_FILES, startupScript } from './script'
 
 const NONCE = 'n1n1n1n1'
 const SHELLS = ['sh', 'dash'].filter((name) => name === 'sh' || existsSync('/bin/dash'))
@@ -277,5 +277,105 @@ describe('ssh script', () => {
         { name: 'ps', code: 127, lines: ['docker: command not found'] },
       ])
     }, false)
+  })
+})
+
+// A fake $HOME (`home` in the temp folder) holding `files`. Each file also ends with a line that would leave `sourced`
+// behind if anything ran it, so the scan is seen to read the files only.
+function withFakeHome<T>(kernel: string, files: Record<string, string>, body: (tmp: string, home: string) => T): T {
+  return withFakeHost(kernel, (tmp) => {
+    const home = join(tmp, 'home')
+    mkdirSync(home)
+    for (const [name, text] of Object.entries(files)) {
+      mkdirSync(join(home, name, '..'), { recursive: true })
+      writeFileSync(join(home, name), `${text}\ntouch "$HOME/sourced"\n`)
+    }
+    return body(tmp, home)
+  }, false)
+}
+
+// The scan script on stdin of `<shell> -s`, with only the temp folder's fake `uname`, the system's sed and grep, and the
+// fake $HOME.
+const scanOn = (shell: string, tmp: string, home: string): string[] =>
+  execFileSync(`/bin/${shell}`, ['-s'], { input: startupScript(NONCE), cwd: tmp, env: { PATH: `${tmp}:/usr/bin:/bin`, HOME: home } })
+    .toString().split('\n')
+
+describe('startup scan script', () => {
+  test('the scanned files are the bash, sh, zsh and fish login files of $HOME, in this order', () => {
+    assert.deepEqual([...STARTUP_FILES], [
+      '.bashrc', '.bash_profile', '.bash_login', '.profile', '.zshrc', '.zprofile', '.zlogin', '.zshenv', '.config/fish/config.fish',
+    ])
+  })
+
+  test('starts like the ssh script, has the one startup section and no docker lookup', () => {
+    const text = startupScript(NONCE)
+    const lines = text.split('\n')
+    assert.deepEqual(lines.slice(0, 5), sshScript(NONCE, []).split('\n').slice(0, 5))
+    assert.deepEqual(lines.filter((l) => l.includes('SEC_')), ['echo "${M}SEC_${N}__ startup"'])
+    assert.equal(/docker|"\$D"/.test(text), false, text)
+    for (const kind of ['BEGIN', 'RC', 'END']) assert.ok(text.includes(`\${M}${kind}_\${N}__`), kind)
+  })
+
+  // Review Focus 1: a file is only tested with -f and read by sed; nothing sources or runs it.
+  test('uses each file only as the argument of [ -f ] and of sed', () => {
+    const uses = startupScript(NONCE).match(/\S+ "\$HOME\/\$f"/g)
+    assert.deepEqual(uses, ['-f "$HOME/$f"', `'s/#.*//' "$HOME/$f"`])
+  })
+
+  for (const shell of SHELLS) {
+    test(`lists the files with an uncommented line naming tmux or screen as a word, by their path in $HOME, in the scan order (${shell})`, () => {
+      withFakeHome('Linux', {
+        '.bashrc': '# exec tmux\nalias sf=screenfetch',
+        '.bash_profile': '[ -z "$TMUX" ] && tmux attach',
+        '.profile': '. "$HOME/tmux-resurrect/init.sh"  # screen -dR',
+        '.zshrc': 'exec tmux',
+        '.zprofile': 'screen -dR',
+        '.zlogin': '[ -n "$TMUX" ] && echo inside',
+        '.zshenv': 'export SCREENDIR="$HOME/.screen"',
+        '.config/fish/config.fish': 'if status is-interactive; and not set -q TMUX; tmux new -As main; end',
+      }, (tmp, home) => {
+        mkdirSync(join(home, '.bash_login')) // a folder, not a file
+        const out = scanOn(shell, tmp, home)
+        assert.equal(readyInfo(out, NONCE)?.kernel, 'Linux', out.join('\n'))
+        assert.deepEqual(extractRun(out, NONCE), {
+          complete: true, truncated: false, results: [{ name: 'startup', code: 0, lines: ['.bash_profile', '.zshrc', '.zprofile', '.config/fish/config.fish'] }],
+        })
+        assert.equal(existsSync(join(home, 'sourced')), false)
+      })
+    })
+
+    test(`a home with none of the files gives an empty startup section (${shell})`, () => {
+      withFakeHome('Darwin', {}, (tmp, home) => {
+        assert.deepEqual(extractRun(scanOn(shell, tmp, home), NONCE).results, [{ name: 'startup', code: 0, lines: [] }])
+      })
+    })
+
+    test(`a kernel other than Linux or macOS stops before the scan (${shell})`, () => {
+      withFakeHome('FreeBSD', { '.bashrc': 'exec tmux' }, (tmp, home) => {
+        const out = scanOn(shell, tmp, home)
+        assert.equal(readyInfo(out, NONCE)?.kernel, 'FreeBSD')
+        assert.equal(out.some((l) => l.includes(`${MARK}BEGIN_`) || l.includes(`${MARK}SEC_`)), false, out.join('\n'))
+      })
+    })
+  }
+
+  // The rule line by line: `#` comments dropped, then tmux, screen, byobu or byobu-launch with no letter, digit, `_`, `.`
+  // or `-` on either side, case-sensitive.
+  test('the rule flags tmux, screen or byobu as a word outside a comment, and nothing else', () => {
+    const flagged = ['tmux', 'exec tmux', '[ -z "$TMUX" ] && tmux attach', 'screen -dR', 'exec /usr/bin/tmux new', 'tmux;', '(screen)',
+      'command -v tmux >/dev/null && exec tmux', 'echo tmux # note', '\ttmux',
+      // Ubuntu's byobu-enable writes the first line into ~/.profile.
+      '_byobu_sourced=1 . /usr/bin/byobu-launch 2>/dev/null || true', 'byobu', 'exec byobu-launch']
+    const ignored = ['# tmux', '   # exec tmux', 'echo hi # screen -dR', 'tmux-resurrect', '~/.tmux.conf', 'tmux_plugins', 'mytmux',
+      'screenfetch', 'screen2', 'TMUX=1', 'export TMUX_TMPDIR=/tmp', 'Screen -dR', '', 'xscreensaver &', '_byobu_sourced=1',
+      'byobu-config', '# byobu-launch']
+    // The heuristic's known limits, kept here so a change to them is seen. Misses: a `#` that is not a comment ends the
+    // line early. Flags: tmux or screen named as a word without starting it.
+    const knownMisses = ['[ $# -eq 0 ] && exec tmux', 'echo "#"; exec tmux']
+    const knownFlags = ["alias ta='tmux attach'", 'plugins=(git tmux)', 'export TERM=screen']
+    const found = (line: string): boolean => withFakeHome('Linux', { '.bashrc': line }, (tmp, home) =>
+      (extractRun(scanOn('sh', tmp, home), NONCE).results[0]?.lines ?? []).includes('.bashrc'))
+    for (const line of [...flagged, ...knownFlags]) assert.equal(found(line), true, JSON.stringify(line))
+    for (const line of [...ignored, ...knownMisses]) assert.equal(found(line), false, JSON.stringify(line))
   })
 })

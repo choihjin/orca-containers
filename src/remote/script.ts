@@ -1,5 +1,5 @@
 import { ownTimeoutSeconds, type DockerCommand } from '../docker/commands'
-import { shellCommand } from '../platform'
+import { shellCommand, shellQuote } from '../platform'
 
 export const MARK = '__CTR_'
 
@@ -10,11 +10,27 @@ function limitWord(command: DockerCommand): string {
   return seconds === undefined ? '$T' : `\${T:+timeout ${seconds}}`
 }
 
+// The nonce and the kernel come first; off Linux and macOS the script stops there.
+function head(nonce: string): string[] {
+  return [
+    `M=${MARK}`,
+    `N=${nonce}`,
+    'K=$(uname -s 2>/dev/null)',
+    'echo "${M}READY_${N}__ $K"',
+    'case "$K" in Linux|Darwin) ;; *) exit 0 ;; esac',
+  ]
+}
+
+// `ts` is the time stamp of BEGIN and END; `rc` ends a section with its name and exit code.
+const MARKER_HELPERS = [
+  'ts() { d=$(date +%s%N 2>/dev/null); case "$d" in *N|"") d=$(( $(date +%s) * 1000000000 ));; esac; echo "$d"; }',
+  'rc() { echo "${M}RC_${N}__ $1 $2"; }',
+]
+
 // BEGIN, one SEC ... RC section per command, END; `$M` and `$N` are set before. Each docker call reads /dev/null.
 function runBody(commands: readonly DockerCommand[], candidates: readonly string[]): string[] {
   const lines = [
-    'ts() { d=$(date +%s%N 2>/dev/null); case "$d" in *N|"") d=$(( $(date +%s) * 1000000000 ));; esac; echo "$d"; }',
-    'rc() { echo "${M}RC_${N}__ $1 $2"; }',
+    ...MARKER_HELPERS,
     'T=; if command -v timeout >/dev/null 2>&1; then T="timeout 20"; fi',
     'D=$(command -v docker 2>/dev/null)',
     ...dockerFallback(candidates),
@@ -59,13 +75,31 @@ export function macTerminalArgv(argv: readonly string[], candidates: readonly st
 // For `ssh <host> sh -s`: the script is the remote shell's stdin, so every docker call reads /dev/null and can never
 // consume the rest of the script. The kernel comes first; off Linux and macOS the script stops before any docker command.
 export function sshScript(nonce: string, commands: readonly DockerCommand[], candidates: readonly string[] = REMOTE_DOCKER_CANDIDATES): string {
+  return [...head(nonce), ...runBody(commands, candidates), ''].join('\n')
+}
+
+// The login startup files the scan reads, as paths in the remote $HOME; its answer names them so, in this order.
+export const STARTUP_FILES: readonly string[] = [
+  '.bashrc', '.bash_profile', '.bash_login', '.profile', '.zshrc', '.zprofile', '.zlogin', '.zshenv', '.config/fish/config.fish',
+]
+// tmux, screen, byobu or byobu-launch (Ubuntu's line in ~/.profile) with no letter, digit, `_`, `.` or `-` on either
+// side: not tmux-resurrect, screenfetch, ~/.tmux.conf or _byobu_sourced.
+const STARTUP_SHELL_ERE = '(^|[^[:alnum:]_.-])(tmux|screen|byobu|byobu-launch)([^[:alnum:]_.-]|$)'
+
+// For `ssh <host> sh -s` before a terminal opens there: the kernel, then one `startup` section that names each login
+// startup file that seems to start tmux, screen or byobu. The files are read, never run: each regular file loses its `#`
+// comments (sed), and its path in $HOME is printed when a line still names one of them as a word (grep). LC_ALL=C makes both
+// read bytes, so the host's locale cannot change the answer. Nothing here reads the script's stdin.
+export function startupScript(nonce: string): string {
   return [
-    `M=${MARK}`,
-    `N=${nonce}`,
-    'K=$(uname -s 2>/dev/null)',
-    'echo "${M}READY_${N}__ $K"',
-    'case "$K" in Linux|Darwin) ;; *) exit 0 ;; esac',
-    ...runBody(commands, candidates),
+    ...head(nonce),
+    ...MARKER_HELPERS,
+    'echo "${M}BEGIN_${N}__ $(ts)"',
+    'echo "${M}SEC_${N}__ startup"',
+    `for f in ${shellCommand(STARTUP_FILES)}; do if [ -f "$HOME/$f" ] && LC_ALL=C sed 's/#.*//' "$HOME/$f" </dev/null 2>/dev/null`
+      + ` | LC_ALL=C grep -Eq ${shellQuote(STARTUP_SHELL_ERE)}; then echo "$f"; fi; done`,
+    'rc startup 0',
+    'echo "${M}END_${N}__ $(ts)"',
     '',
   ].join('\n')
 }
