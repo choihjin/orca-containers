@@ -1,0 +1,91 @@
+<!doctype html>
+<!-- Plugin page screenshot frame (1600×1000). Query: ?theme=light|dark&shot=<name>[,<name>]&slide=<id>
+     Panel PNGs come from `orca plugin shot . --scenario <name>` (assets/src/shots/<name>-<theme>.png).
+     Render: assets/src/render.sh -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg1: #F8FAFC; --bg2: #E0F2FE; --ink: #0F172A; --muted: #475569; --accent: #0F766E;
+    --card: #FFFFFF; --edge: rgba(15, 23, 42, 0.10); --shadow: 0 30px 60px rgba(15, 23, 42, 0.18);
+  }
+  :root[data-theme="dark"] {
+    --bg1: #0B1120; --bg2: #102A43; --ink: #F1F5F9; --muted: #A8B3C4; --accent: #2DD4BF;
+    --card: #111827; --edge: rgba(255, 255, 255, 0.10); --shadow: 0 30px 60px rgba(0, 0, 0, 0.55);
+  }
+  html, body { margin: 0; width: 1600px; height: 1000px; overflow: hidden; }
+  body {
+    background: radial-gradient(1200px 800px at 85% 20%, var(--bg2), var(--bg1));
+    color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 620px 1fr; align-items: center; gap: 40px; padding: 0 90px; box-sizing: border-box;
+  }
+  .brand { display: flex; align-items: center; gap: 14px; font-size: 22px; font-weight: 600; color: var(--muted); }
+  .brand img { width: 44px; height: 44px; }
+  h1 { font-size: 54px; line-height: 1.08; letter-spacing: -0.02em; margin: 28px 0 28px; }
+  ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 18px; }
+  li { font-size: 25px; line-height: 1.4; color: var(--muted); padding-left: 34px; position: relative; }
+  li::before { content: ""; position: absolute; left: 0; top: 13px; width: 14px; height: 14px; border-radius: 4px; background: var(--accent); }
+  .shots { display: flex; justify-content: center; align-items: center; gap: 36px; }
+  .shot { background: var(--card); border: 1px solid var(--edge); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; }
+  .shot img { display: block; zoom: var(--zoom, 1.3); }
+  .shots.pair { --zoom: 1.15; flex-direction: column; gap: 22px; }
+  .shots.pair .label { margin-top: 10px; }
+  .label { text-align: center; font-size: 18px; color: var(--muted); margin-top: 14px; }
+</style>
+</head>
+<body>
+<section>
+  <div class="brand"><img src="../icon.png" alt="">Containers for Orca</div>
+  <h1 id="title"></h1>
+  <ul id="points"></ul>
+</section>
+<section class="shots" id="shots"></section>
+<script>
+  const SLIDES = {
+    ssh: {
+      title: 'Containers on your SSH hosts',
+      points: [
+        'Pick any Linux SSH host Orca knows, or follow the focused workspace',
+        'Lists, actions and logs run over ssh from this Mac: no terminal tabs',
+        'Compose projects grouped by service',
+      ],
+    },
+    resources: {
+      title: 'The whole host at a glance',
+      points: [
+        'Containers, images, volumes and networks',
+        'Start, stop, restart or delete from the details card',
+        'Filter by name, image, service or project',
+      ],
+    },
+    problems: {
+      title: 'Clear answers when something is off',
+      points: [
+        'Host unreachable, Docker not running, ssh login problems',
+        'Each message says what to check next',
+      ],
+      labels: ['SSH host unreachable', 'Docker daemon stopped'],
+    },
+  }
+  const q = new URLSearchParams(location.search)
+  const theme = q.get('theme') === 'dark' ? 'dark' : 'light'
+  document.documentElement.dataset.theme = theme
+  const slide = SLIDES[q.get('slide')] ?? SLIDES.ssh
+  document.getElementById('title').textContent = slide.title
+  for (const text of slide.points) {
+    const li = document.createElement('li'); li.textContent = text; document.getElementById('points').append(li)
+  }
+  const names = (q.get('shot') ?? 'ssh').split(',')
+  if (names.length > 1) document.getElementById('shots').classList.add('pair')
+  names.forEach((name, i) => {
+    const wrap = document.createElement('div')
+    const card = document.createElement('div'); card.className = 'shot'
+    const img = document.createElement('img'); img.src = `shots/${name}-${theme}.png`; img.alt = ''
+    card.append(img); wrap.append(card)
+    if (slide.labels?.[i]) { const l = document.createElement('div'); l.className = 'label'; l.textContent = slide.labels[i]; wrap.append(l) }
+    document.getElementById('shots').append(wrap)
+  })
+</script>
+</body>
+</html>

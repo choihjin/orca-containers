@@ -1,5 +1,7 @@
 # Containers for Orca
 
+![Containers panels for this Mac and an SSH host](assets/cover.png)
+
 See and manage Docker containers from an [Orca](https://github.com/stablyai/orca) sidebar panel, on
 this Mac and on your Linux SSH hosts. Pick a host, see its containers, images, volumes and networks (images,
 volumes and networks are listed read-only), and start, stop, restart, read logs, open a shell or
@@ -50,10 +52,10 @@ In Orca, open **Settings → Plugins**, choose **Add plugin → From a Git URL�
 URL with a version tag and install:
 
 ```text
-https://github.com/choihjin/orca-containers#v0.1.0
+https://github.com/choihjin/orca-containers#v0.1.1
 ```
 
-Or from a terminal: `orca plugin install choihjin/orca-containers@v0.1.0`.
+Or from a terminal: `orca plugin install choihjin/orca-containers@v0.1.1`.
 
 Orca shows what the plugin asks for before it runs anything. Review it, then enable it.
 
@@ -109,6 +111,10 @@ pnpm test        # orca plugin test .
 pnpm typecheck   # writes Orca's typings, then tsc
 orca plugin validate .
 ```
+
+The icon, cover and screenshots are HTML pages in `assets/src`. `assets/src/render.sh shots` captures the
+panel from the check scenarios (Orca's window must be hidden or minimized), and `assets/src/render.sh images`
+renders the PNGs with headless Chrome.
 
 ## License
 

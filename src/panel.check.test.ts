@@ -12,7 +12,7 @@ afterEach(async () => {
 })
 
 test('every check scenario stubs exactly the six worker requests', () => {
-  assert.deepEqual(Object.keys(scenarios).sort(), ['daemonDown', 'empty', 'local', 'ssh', 'unreachable'])
+  assert.deepEqual(Object.keys(scenarios).sort(), ['daemonDown', 'empty', 'local', 'resources', 'ssh', 'unreachable'])
   for (const [name, scenario] of Object.entries(scenarios)) {
     const stubs = scenario.requests ?? {}
     assert.deepEqual(Object.keys(stubs).sort(), REQUEST_NAMES, name)
@@ -28,6 +28,8 @@ test('each check scenario draws the screen it is named for', async () => {
     daemonDown: { line: 'EmptyState "Docker is not running"' },
     unreachable: { line: 'EmptyState "Host unreachable"' },
     empty: { text: 'No containers' },
+    // This Mac with every section open, for the plugin page screenshots.
+    resources: { line: 'Tree "Volumes": 1 top-level item(s)' },
   }
   for (const [name, want] of Object.entries(expected)) {
     const scenario = scenarios[name as keyof typeof scenarios]

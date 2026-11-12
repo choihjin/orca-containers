@@ -77,4 +77,8 @@ export default defineCheck({
     persisted: { plugin: { selectedHost: 'ssh:GPU2' } },
   }),
   empty: scenario(stubs([LOCAL], ({ hostId }) => snapshot(hostId, []))),
+  // This Mac with every section open, for the plugin page screenshots.
+  resources: scenario(stubs([LOCAL, GPU1], listed), {
+    persisted: { plugin: { sections: { containers: true, images: true, volumes: true, networks: true } } },
+  }),
 })

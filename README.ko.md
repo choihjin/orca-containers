@@ -1,5 +1,7 @@
 # Containers for Orca
 
+![이 Mac과 SSH 호스트의 Containers 패널](assets/cover.png)
+
 [Orca](https://github.com/stablyai/orca) 사이드바 패널에서 Docker 컨테이너를 보고 관리합니다. 이 Mac과
 Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너, 이미지, 볼륨, 네트워크를 볼 수 있습니다(이미지,
 볼륨, 네트워크는 보기만 가능). 컨테이너는 시작, 중지, 재시작하거나 로그를 보고 셸을 열고 삭제할 수 있습니다.
@@ -44,10 +46,10 @@ Orca에서 **Settings → Plugins**를 열고 **Add plugin → From a Git URL…
 저장소 주소를 붙여 넣어 설치합니다.
 
 ```text
-https://github.com/choihjin/orca-containers#v0.1.0
+https://github.com/choihjin/orca-containers#v0.1.1
 ```
 
-터미널에서는 `orca plugin install choihjin/orca-containers@v0.1.0`으로도 설치할 수 있습니다.
+터미널에서는 `orca plugin install choihjin/orca-containers@v0.1.1`으로도 설치할 수 있습니다.
 
 Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. 확인한 뒤 켜세요.
 
@@ -101,6 +103,9 @@ pnpm test        # orca plugin test .
 pnpm typecheck   # Orca 타입을 생성한 뒤 tsc 실행
 orca plugin validate .
 ```
+
+아이콘, 커버, 스크린샷은 `assets/src`의 HTML 페이지로 만듭니다. `assets/src/render.sh shots`는 check 시나리오의 패널을
+찍고(Orca 창을 숨기거나 최소화해야 함), `assets/src/render.sh images`는 headless Chrome으로 PNG를 만듭니다.
 
 ## 라이선스
 
