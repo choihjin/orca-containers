@@ -19,6 +19,12 @@ const okResults = (): CommandResult[] => [
 const WORKSPACES = { workspaces: [{ id: 'ws1', kind: 'worktree', name: 'proj', path: '/Users/x/proj', branch: 'main', hostId: null }], truncated: false }
 const CONTEXT = { branch: 'main', displayName: 'proj', terminals: [{ id: 't1', title: 'a' }] }
 const ID = 'a'.repeat(12)
+// The labels of a member container of Compose project `shop`, as docker inspect prints them.
+const LABELS = JSON.stringify({
+  'com.docker.compose.project': 'shop', 'com.docker.compose.project.working_dir': '/srv/shop',
+  'com.docker.compose.project.config_files': '/srv/shop/compose.yml', 'com.docker.compose.service': 'web',
+})
+const SHOP_ARGV = ['compose', '--project-directory', '/srv/shop', '-p', 'shop', '-f', '/srv/shop/compose.yml']
 
 // What the remote `sh -s` would print for the script on stdin: READY Linux, then every section with its result.
 function remoteOutput(script: string, results: Record<string, { code: number; lines: string[] }> = {}): string {
@@ -45,6 +51,8 @@ function setup(results: Record<string, unknown> = {}, cliSetup?: (cli: FakeCli) 
       runs.push({ deadline: options.deadline, hasSignal: options.signal instanceof AbortSignal, argv: commands.map((c) => c.argv) })
       if (commands.some((c) => c.name === 'logs')) return [{ name: 'logs', code: 0, lines: ['l1', 'l2'] }]
       if (commands.some((c) => c.name === 'remove')) return [{ name: 'remove', code: 0, lines: [] }]
+      if (commands.some((c) => c.name === 'labels')) return [{ name: 'labels', code: 0, lines: [LABELS] }]
+      if (commands.some((c) => c.name === 'compose')) return [{ name: 'compose', code: 0, lines: [] }]
       return commands.some((c) => c.name === 'action') ? [{ name: 'action', code: 0, lines: [] }] : okResults()
     },
   }
@@ -372,6 +380,136 @@ test('an SSH pull opens an Orca terminal on that host after the kernel check, an
     command: 'docker pull ghcr.io/org/app:1.2', focus: true,
   }])
   assert.deepEqual(s.cli.calls.filter((c) => c.method === 'switchTo').map((c) => c.environment), ['GPU1'])
+})
+
+test('answers docker.composeAction with the exact shape: the labels lookup, then one compose command on this Mac', async () => {
+  for (const action of ['start', 'stop', 'restart', 'down'] as const) {
+    const s = setup()
+    const w = await mountWorker(s.module, { host: s.host })
+    const r = await w.request('docker.composeAction', { hostId: 'local', project: 'shop', memberId: ID, action })
+    assert.deepEqual(r, { ok: true, value: { done: true } }, action)
+    assert.deepEqual(JSON.parse(JSON.stringify(r)), r)
+    assert.deepEqual(s.runs.map((run) => run.argv), [[['inspect', '--format', '{{json .Config.Labels}}', ID]], [[...SHOP_ARGV, action]]], action)
+    assert.deepEqual(s.runs.map((run) => run.deadline), [101_000, 101_000])
+    assert.deepEqual(s.host.callsOf('workspace.readContext'), [])
+    assert.deepEqual(s.host.callsOf('terminal.create'), [])
+    assert.deepEqual(w.refusals, [])
+  }
+})
+
+test('an SSH compose action is two ssh runs, labels then compose under its 55 s limit, and opens no terminal', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  s.ssh.answer = async (call) => ({
+    code: 0, timedOut: false, stderr: '', stdout: remoteOutput(call.input, { labels: { code: 0, lines: [LABELS] } }),
+  })
+  assert.deepEqual(await w.request('docker.composeAction', { hostId: 'ssh:GPU1', project: 'shop', memberId: ID, action: 'down' }), { ok: true, value: { done: true } })
+  assert.equal(s.execs.length, 2)
+  assert.ok(s.execs[0]!.input.includes(`$T "$D" inspect --format '{{json .Config.Labels}}' ${ID} </dev/null`), s.execs[0]!.input)
+  assert.equal(s.execs[0]!.input.includes('compose'), false)
+  assert.ok(s.execs[1]!.input.includes('${T:+timeout 55} "$D" compose --project-directory /srv/shop -p shop -f /srv/shop/compose.yml down </dev/null'), s.execs[1]!.input)
+  assert.equal(s.cli.calls.some((c) => c.method === 'createTerminal'), false)
+  assert.deepEqual(s.host.callsOf('terminal.create'), [])
+  assert.deepEqual(s.host.callsOf('workspace.readContext'), [])
+  // Labels of another project stop before compose.
+  s.ssh.answer = async (call) => ({
+    code: 0, timedOut: false, stderr: '',
+    stdout: remoteOutput(call.input, { labels: { code: 0, lines: [LABELS.replace('"shop"', '"other"')] } }),
+  })
+  assert.deepEqual(await w.request('docker.composeAction', { hostId: 'ssh:GPU1', project: 'shop', memberId: ID, action: 'stop' }),
+    { ok: false, problem: { kind: 'failed', message: 'This container is not part of Compose project shop' } })
+  assert.equal(s.execs.length, 3)
+  assert.deepEqual(w.refusals, [])
+})
+
+test('an SSH compose that timeout 55 ended (rc 124) answers unknown-result through the real ssh runner', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  s.ssh.answer = async (call) => ({
+    code: 0, timedOut: false, stderr: '',
+    stdout: remoteOutput(call.input, { labels: { code: 0, lines: [LABELS] }, compose: { code: 124, lines: [' Container shop-web-1  Stopping'] } }),
+  })
+  assert.deepEqual(await w.request('docker.composeAction', { hostId: 'ssh:GPU1', project: 'shop', memberId: ID, action: 'stop' }),
+    { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } })
+  assert.equal(s.execs.length, 2)
+  assert.deepEqual(w.refusals, [])
+})
+
+test('answers docker.composeUp by opening a local terminal with docker compose ... up -d and its title', async () => {
+  const s = setup()
+  const w = await mountWorker(s.module, { host: s.host })
+  const r = await w.request('docker.composeUp', { hostId: 'local', project: 'shop', memberId: ID })
+  assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), r)
+  assert.deepEqual(s.runs.map((run) => run.argv), [[['inspect', '--format', '{{json .Config.Labels}}', ID]]])
+  assert.deepEqual(s.host.callsOf('terminal.create'), [{
+    workspaceId: 'ws1', title: 'compose up: shop', command: 'docker compose --project-directory /srv/shop -p shop -f /srv/shop/compose.yml up -d',
+  }])
+  assert.equal(s.host.callsOf('workspace.readContext').length, 1)
+  assert.deepEqual(w.refusals, [])
+})
+
+test('an SSH compose up checks the kernel, looks up the labels, then opens an Orca terminal on that host', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  s.ssh.answer = async (call) => ({
+    code: 0, timedOut: false, stderr: '', stdout: remoteOutput(call.input, { labels: { code: 0, lines: [LABELS] } }),
+  })
+  const r = await w.request('docker.composeUp', { hostId: 'ssh:GPU1', project: 'shop', memberId: ID })
+  assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
+  assert.equal(s.execs.length, 2)
+  assert.equal(s.execs[0]!.input.includes('SEC_'), false, s.execs[0]!.input)
+  assert.ok(s.execs[1]!.input.includes('"$D" inspect'), s.execs[1]!.input)
+  assert.deepEqual(s.cli.calls.filter((c) => c.method === 'createTerminal'), [{
+    method: 'createTerminal', environment: 'GPU1', worktreePath: '/home/u/proj', title: 'compose up: shop',
+    command: 'docker compose --project-directory /srv/shop -p shop -f /srv/shop/compose.yml up -d', focus: true,
+  }])
+  assert.deepEqual(s.cli.calls.filter((c) => c.method === 'switchTo').map((c) => c.environment), ['GPU1'])
+})
+
+test('compose requests with a bad shape or a bad value are invalid and run or open nothing', async () => {
+  const s = setup({}, sshHost)
+  const w = await mountWorker(s.module, { host: s.host })
+  const good = { hostId: 'local', project: 'shop', memberId: ID }
+  const cases: [string, unknown][] = [
+    ['docker.composeAction', null],
+    ['docker.composeAction', ['local', 'shop', ID, 'stop']],
+    ['docker.composeAction', { ...good, hostId: 'remote', action: 'stop' }],
+    ['docker.composeAction', { ...good, hostId: 'ssh:', action: 'stop' }],
+    ['docker.composeAction', { ...good, project: undefined, action: 'stop' }],
+    ['docker.composeAction', { ...good, project: 5, action: 'stop' }],
+    ['docker.composeAction', { ...good, memberId: undefined, action: 'stop' }],
+    ['docker.composeAction', { ...good, memberId: [ID], action: 'stop' }],
+    ['docker.composeAction', good],
+    ['docker.composeAction', { ...good, action: 'remove' }],
+    ['docker.composeAction', { ...good, action: 'up' }],
+    ['docker.composeAction', { ...good, action: 'down -v' }],
+    ['docker.composeAction', { ...good, action: 'constructor' }],
+    ['docker.composeUp', null],
+    ['docker.composeUp', { ...good, hostId: 'ssh:' }],
+    ['docker.composeUp', { ...good, project: null }],
+    ['docker.composeUp', { ...good, memberId: 5 }],
+    ['docker.composeUp', { hostId: 'local', project: 'shop' }],
+  ]
+  // Shaped right, but the service refuses the value.
+  for (const hostId of ['local', 'ssh:GPU1']) {
+    for (const project of ['-p', 'Shop', 'a b', '$(id)', 'a\nb', '']) {
+      cases.push(['docker.composeAction', { hostId, project, memberId: ID, action: 'stop' }], ['docker.composeUp', { hostId, project, memberId: ID }])
+    }
+    for (const memberId of ['web', '-f', 'x; reboot', '']) {
+      cases.push(['docker.composeAction', { hostId, project: 'shop', memberId, action: 'stop' }], ['docker.composeUp', { hostId, project: 'shop', memberId }])
+    }
+  }
+  for (const [name, input] of cases) {
+    const r = await w.request(name as 'docker.composeUp', input as never) as { ok: boolean; problem: { kind: string } }
+    assert.equal(r.ok, false, `${name} ${JSON.stringify(input)}`)
+    assert.equal(r.problem.kind, 'invalid', `${name} ${JSON.stringify(input)}`)
+  }
+  assert.equal(s.runs.length, 0)
+  assert.equal(s.execs.length, 0)
+  assert.deepEqual(s.host.callsOf('terminal.create'), [])
+  assert.equal(s.cli.calls.some((c) => c.method === 'createTerminal'), false)
+  assert.deepEqual(w.refusals, [])
 })
 
 test('deactivate does not create the dependencies', async () => {

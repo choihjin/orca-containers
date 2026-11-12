@@ -2,8 +2,9 @@ import { assert, test } from 'orca/testing'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { DockerCommand } from '../docker/commands'
+import { composeCommand, composeLabelsCommand, type DockerCommand } from '../docker/commands'
 import { createLocalRunner, createMergedOutput, execResultFromError, LOCAL_TIMEOUT_MS, runMerged, type LocalDeps, type LocalExec } from './runner'
+import { sshScript } from '../remote/script'
 
 const PS: DockerCommand = { name: 'ps', argv: ['ps'] }
 const IMAGES: DockerCommand = { name: 'images', argv: ['images'] }
@@ -87,7 +88,7 @@ test('the merge helper refuses a chunk past maxBuffer and keeps what fit', () =>
 test('a timed-out command is code 124', async () => {
   const t = setup({ existing: ['/usr/bin/docker'], reply: () => ({ code: 1, stdout: 'x\n', stderr: '', timedOut: true }) })
   const [r] = await t.runner.run([PS], { deadline: 100_000 })
-  assert.equal(r?.code, 124)
+  assert.deepEqual(r, { name: 'ps', code: 124, lines: ['x'] }) // started: not marked skipped
 })
 
 test('caps each command at the local timeout and the remaining budget', async () => {
@@ -97,13 +98,63 @@ test('caps each command at the local timeout and the remaining budget', async ()
   assert.deepEqual(t.calls.map((c) => c.timeoutMs), [LOCAL_TIMEOUT_MS, 5_000])
 })
 
+test('a compose command gets its own 55 s limit, within the remaining budget; every other command keeps 20 s', async () => {
+  const COMPOSE = composeCommand({ project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml'] }, 'stop')
+  const LABELS = composeLabelsCommand('a'.repeat(12))
+  const t = setup({ existing: ['/usr/bin/docker'] })
+  await t.runner.run([PS, LABELS, COMPOSE, IMAGES], { deadline: 100_000 })
+  await t.runner.run([COMPOSE], { deadline: 30_000 })
+  assert.equal(LOCAL_TIMEOUT_MS, 20_000)
+  assert.deepEqual(t.calls.map((c) => c.timeoutMs), [20_000, 20_000, 55_000, 20_000, 30_000])
+  assert.deepEqual(t.calls[2]?.args, COMPOSE.argv)
+  assert.equal(t.calls[2]?.merge, undefined)
+})
+
+// The service tells a compose command that was started and cut off (its result is unknown) from one never started.
+test('only a command never started is marked skipped: no time left before exec, an abort, or no time for the lookup', async () => {
+  const COMPOSE = composeCommand({ project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml'] }, 'stop')
+  // Started and cut off by its own limit: 124, not skipped.
+  const cut = setup({ existing: ['/usr/bin/docker'], reply: () => ({ code: 1, stdout: '', stderr: '', timedOut: true }) })
+  assert.deepEqual(await cut.runner.run([COMPOSE], { deadline: 100_000 }), [{ name: 'compose', code: 124, lines: [] }])
+  // The labels run used the budget up: compose never starts.
+  let now = 0
+  const used = setup({ existing: ['/usr/bin/docker'], time: () => now, reply: () => { now = 1_000; return ok('') } })
+  assert.deepEqual(await used.runner.run([composeLabelsCommand('a'.repeat(12)), COMPOSE], { deadline: 1_000 }), [
+    { name: 'labels', code: 0, lines: [] }, { name: 'compose', code: 124, lines: [], skipped: true },
+  ])
+  const ctl = new AbortController()
+  ctl.abort()
+  assert.deepEqual(await setup({ existing: ['/usr/bin/docker'] }).runner.run([COMPOSE], { deadline: 100_000, signal: ctl.signal }),
+    [{ name: 'compose', code: 124, lines: [], skipped: true }])
+  const noLookup = setup({ shell: '/somewhere/docker' })
+  assert.deepEqual(await noLookup.runner.run([COMPOSE], { deadline: 4_000 }), [{ name: 'compose', code: 124, lines: [], skipped: true }])
+  // A docker that itself exits 124 was started.
+  const own = setup({ existing: ['/usr/bin/docker'], reply: () => ({ code: 124, stdout: '', stderr: 'x\n', timedOut: false }) })
+  assert.deepEqual(await own.runner.run([COMPOSE], { deadline: 100_000 }), [{ name: 'compose', code: 124, lines: ['x'] }])
+})
+
+test('a timeoutSeconds that is not a positive whole number is refused before anything runs, as the ssh script refuses it', async () => {
+  for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const t = setup({ existing: ['/usr/bin/docker'] })
+    const command: DockerCommand = { name: 'compose', argv: ['compose'], timeoutSeconds: bad }
+    let thrown: unknown = null
+    try { await t.runner.run([PS, command], { deadline: 100_000 }) } catch (e) { thrown = e }
+    let scriptThrown: unknown = null
+    try { sshScript('abcdef01', [command]) } catch (e) { scriptThrown = e }
+    assert.ok(thrown instanceof Error, String(bad))
+    assert.equal((thrown as Error).message, (scriptThrown as Error).message, String(bad))
+    assert.match((thrown as Error).message, /timeoutSeconds/)
+    assert.equal(t.calls.length, 0, String(bad))
+  }
+})
+
 test('stops at the deadline', async () => {
   let now = 0
   const t = setup({ existing: ['/usr/bin/docker'], time: () => now, reply: () => { now = 1_000; return ok('') } })
   const res = await t.runner.run([PS, IMAGES, PS], { deadline: 1_000 })
   assert.equal(t.calls.length, 1)
   assert.deepEqual(res.map((r) => r.code), [0, 124, 124])
-  assert.deepEqual(res[1], { name: 'images', code: 124, lines: [] })
+  assert.deepEqual(res[1], { name: 'images', code: 124, lines: [], skipped: true })
 })
 
 test('an aborted signal returns code 124 without calling exec', async () => {
@@ -111,7 +162,7 @@ test('an aborted signal returns code 124 without calling exec', async () => {
   const ctl = new AbortController()
   ctl.abort()
   const res = await t.runner.run([PS], { deadline: 100_000, signal: ctl.signal })
-  assert.deepEqual(res, [{ name: 'ps', code: 124, lines: [] }])
+  assert.deepEqual(res, [{ name: 'ps', code: 124, lines: [], skipped: true }])
   assert.equal(t.calls.length, 0)
 })
 
@@ -120,21 +171,21 @@ test('an aborted signal never starts the login shell lookup', async () => {
   const ctl = new AbortController()
   ctl.abort()
   const res = await t.runner.run([PS, IMAGES], { deadline: 100_000, signal: ctl.signal })
-  assert.deepEqual(res, [{ name: 'ps', code: 124, lines: [] }, { name: 'images', code: 124, lines: [] }])
+  assert.deepEqual(res, [{ name: 'ps', code: 124, lines: [], skipped: true }, { name: 'images', code: 124, lines: [], skipped: true }])
   assert.equal(t.shellCalls(), 0)
 })
 
 test('an expired deadline never starts the login shell lookup', async () => {
   const t = setup({ shell: '/somewhere/docker', time: () => 10 })
   const res = await t.runner.run([PS], { deadline: 10 })
-  assert.deepEqual(res, [{ name: 'ps', code: 124, lines: [] }])
+  assert.deepEqual(res, [{ name: 'ps', code: 124, lines: [], skipped: true }])
   assert.equal(t.shellCalls(), 0)
 })
 
 test('skips the login shell lookup when its timeout does not fit (code 124), without caching the miss', async () => {
   const t = setup({ shell: '/somewhere/docker' })
   const [short] = await t.runner.run([PS], { deadline: 4_000 })
-  assert.deepEqual(short, { name: 'ps', code: 124, lines: [] })
+  assert.deepEqual(short, { name: 'ps', code: 124, lines: [], skipped: true })
   assert.equal(t.shellCalls(), 0)
   await t.runner.run([PS], { deadline: 100_000 })
   assert.equal(t.shellCalls(), 1)

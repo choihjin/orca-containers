@@ -1,11 +1,11 @@
 import { assert, describe, test } from 'orca/testing'
-import type { ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Problem, ResourceKind, Result } from './protocol'
+import type { ComposeAction, ContainerAction, FocusContext, HostId, HostInfo, HostStatus, Problem, ResourceKind, Result } from './protocol'
 import { createHosts, type Anchor, type Hosts, type NoAnchor } from './hosts'
-import type { LocalRunner } from './local/runner'
+import { createLocalRunner, type LocalRunner } from './local/runner'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
 import { CliError, type CallOptions, type OrcaCli } from './remote/orca-cli'
 import { FakeCli } from './remote/fake-cli'
-import { pullArgv, terminalArgv, type DockerCommand } from './docker/commands'
+import { composeCommand, composeLabelsCommand, composeUpArgv, pullArgv, terminalArgv, type ComposeTarget, type DockerCommand } from './docker/commands'
 import { shellCommand } from './platform'
 import { macTerminalArgv } from './remote/script'
 import type { CommandResult } from './docker/parse'
@@ -14,6 +14,19 @@ import { createService, terminalTitle } from './service'
 const ID = 'a'.repeat(12)
 const OPTIONS = { deadline: 1_000 }
 const FOCUS: FocusContext = { displayName: 'main', branch: 'main', terminalIds: [] }
+
+// One member container of Compose project `shop`, and the labels docker inspect gives for it.
+const MEMBER = 'c'.repeat(12)
+const SHOP: ComposeTarget = { project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml', '/srv/shop/compose.gpu.yml'] }
+const labelsLine = (o: Record<string, unknown> = {}): string => JSON.stringify({
+  'com.docker.compose.project': 'shop', 'com.docker.compose.project.working_dir': SHOP.dir,
+  'com.docker.compose.project.config_files': SHOP.files.join(','), 'com.docker.compose.service': 'web', ...o,
+})
+const LABELS_OK: CommandResult = { name: 'labels', code: 0, lines: [labelsLine()] }
+const COMPOSE_OK: CommandResult = { name: 'compose', code: 0, lines: [' Container shop-web-1  Stopped'] }
+// Answers each command of a run by its name.
+const byName = (answers: Record<string, CommandResult>) => (commands: readonly DockerCommand[]): CommandResult[] =>
+  commands.flatMap((c) => (answers[c.name] ? [answers[c.name]!] : []))
 
 const versionLine = JSON.stringify({ Server: { Version: '27.0.1' } })
 const okResults = (): CommandResult[] => [
@@ -38,8 +51,9 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
     anchors: [] as { hostId: HostId; focus: FocusContext | null }[],
     order: [] as string[], // every call, the host lookups included
   }
-  let localResults: CommandResult[] = okResults()
-  let sshResult: Result<CommandResult[]> = { ok: true, value: okResults() }
+  // A fixed answer, or one built from the commands of each run.
+  let localResults: CommandResult[] | ((commands: readonly DockerCommand[]) => CommandResult[]) = okResults()
+  let sshResult: Result<CommandResult[]> | ((commands: readonly DockerCommand[]) => Result<CommandResult[]>) = { ok: true, value: okResults() }
   let createError: Error | null = null
   let switchError: Error | null = null
   const status = opts.status ?? 'ready'
@@ -67,13 +81,17 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
     async delete(key) { stored.delete(key) },
   }
   const local: LocalRunner = {
-    async run(commands, options) { calls.push('local.run'); log.order.push('local.run'); log.localRuns.push({ commands, options }); return localResults },
+    async run(commands, options) {
+      calls.push('local.run'); log.order.push('local.run'); log.localRuns.push({ commands, options })
+      return typeof localResults === 'function' ? localResults(commands) : localResults
+    },
   }
   const ssh: SshRunner = {
     async run(env, commands, options) {
       calls.push('ssh.run'); log.order.push('ssh.run'); log.sshRuns.push({ env, commands, options })
-      if (commands.length === 0 && checkKernel !== null) stored.set(kernelKey(env), checkKernel)
-      return sshResult
+      // The real runner stores the kernel on every run that reaches READY.
+      if (checkKernel !== null) stored.set(kernelKey(env), checkKernel)
+      return typeof sshResult === 'function' ? sshResult(commands) : sshResult
     },
   }
   const cli = {
@@ -95,8 +113,8 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
   })
   return {
     service, calls, log,
-    setLocal(r: CommandResult[]) { localResults = r },
-    setSsh(r: Result<CommandResult[]>) { sshResult = r },
+    setLocal(r: CommandResult[] | ((commands: readonly DockerCommand[]) => CommandResult[])) { localResults = r },
+    setSsh(r: Result<CommandResult[]> | ((commands: readonly DockerCommand[]) => Result<CommandResult[]>)) { sshResult = r },
     failCreate(e: Error) { createError = e },
     failSwitch(e: Error) { switchError = e },
     failStorageRead() { storageFails = true },
@@ -120,13 +138,13 @@ function noTerminalSetup() {
   const runs: { env: string; names: string[] }[] = []
   const answers: Record<string, CommandResult[]> = {
     snapshot: okResults(), action: [{ name: 'action', code: 0, lines: [ID] }], logs: [{ name: 'logs', code: 0, lines: ['ssh log'] }],
-    remove: [{ name: 'remove', code: 0, lines: ['pgdata'] }],
+    remove: [{ name: 'remove', code: 0, lines: ['pgdata'] }], labels: [LABELS_OK], compose: [COMPOSE_OK],
   }
   const ssh: SshRunner = {
     async run(env, commands) {
       const names = commands.map((c) => c.name)
       runs.push({ env, names })
-      const single = ['action', 'logs', 'remove'].find((name) => names.includes(name as DockerCommand['name']))
+      const single = ['action', 'logs', 'remove', 'labels', 'compose'].find((name) => names.includes(name as DockerCommand['name']))
       return { ok: true, value: answers[single ?? 'snapshot']! }
     },
   }
@@ -741,6 +759,370 @@ describe('service: pull an image in a terminal', () => {
     await t.service.pullTerminal('local', long, FOCUS, OPTIONS)
     assert.equal(t.log.localTerminals[0]!.title, `pull: ${long.slice(0, 40)}…`)
     assert.equal(t.log.localTerminals[0]!.command, `docker pull ${long}`)
+  })
+})
+
+const NOT_SHOP = { ok: false, problem: { kind: 'failed', message: 'This container is not part of Compose project shop' } }
+const NO_FILES = { ok: false, problem: { kind: 'failed', message: "Compose did not record where this project's files are" } }
+const COMPOSE_ACTIONS: readonly ComposeAction[] = ['start', 'stop', 'restart', 'down']
+const BAD_PROJECTS = ['', 'Shop', '-p', '--volumes', 'a b', 'a;b', '$(id)', 'a\nb', '_shop', 'a'.repeat(64)]
+const BAD_MEMBERS = ['', 'web', '-f', 'x; reboot', 'C'.repeat(12), 'c'.repeat(11), 'c'.repeat(65)]
+
+describe('service: Compose project actions', () => {
+  test('a local action looks up the member\'s labels, then runs one compose command for the whole project, with no anchor lookup', async () => {
+    for (const action of COMPOSE_ACTIONS) {
+      const t = setup({ anchor: { missing: 'no-workspace' } })
+      t.setLocal(byName({ labels: LABELS_OK, compose: COMPOSE_OK }))
+      assert.deepEqual(await t.service.composeAction('local', 'shop', MEMBER, action, OPTIONS), { ok: true, value: { done: true } }, action)
+      assert.deepEqual(t.log.localRuns, [
+        { commands: [composeLabelsCommand(MEMBER)], options: OPTIONS },
+        { commands: [composeCommand(SHOP, action)], options: OPTIONS },
+      ], action)
+      assert.deepEqual(t.log.order, ['local.run', 'local.run'], action)
+      assert.deepEqual([...t.log.anchors, ...t.log.sshRuns, ...t.log.created, ...t.log.localTerminals], [], action)
+    }
+  })
+
+  test('an SSH action is two ssh runs, labels then compose, with no anchor, terminal, storage or memory', async () => {
+    for (const action of COMPOSE_ACTIONS) {
+      const t = setup({ anchor: { path: '/home/me/main' } })
+      t.setSsh((commands) => ({ ok: true, value: byName({ labels: LABELS_OK, compose: COMPOSE_OK })(commands) }))
+      assert.deepEqual(await t.service.composeAction('ssh:A', 'shop', MEMBER, action, OPTIONS), { ok: true, value: { done: true } }, action)
+      assert.deepEqual(t.log.sshRuns, [
+        { env: 'A', commands: [composeLabelsCommand(MEMBER)], options: OPTIONS },
+        { env: 'A', commands: [composeCommand(SHOP, action)], options: OPTIONS },
+      ], action)
+      assert.deepEqual(t.log.order, ['ssh.run', 'ssh.run'], action)
+      assert.deepEqual(t.log.remembered, [])
+    }
+    const bare = noTerminalSetup()
+    assert.deepEqual(await bare.service.composeAction('ssh:A', 'shop', MEMBER, 'down', OPTIONS), { ok: true, value: { done: true } })
+    assert.deepEqual(bare.runs, [{ env: 'A', names: ['labels'] }, { env: 'A', names: ['compose'] }])
+    assert.deepEqual(bare.used, [])
+  })
+
+  test('down is compose down: volumes and images are kept', async () => {
+    const t = setup()
+    t.setLocal(byName({ labels: LABELS_OK, compose: COMPOSE_OK }))
+    await t.service.composeAction('local', 'shop', MEMBER, 'down', OPTIONS)
+    const argv = t.log.localRuns[1]!.commands[0]!.argv
+    assert.deepEqual(argv.slice(-1), ['down'])
+    for (const word of ['-v', '--volumes', '--rmi']) assert.equal(argv.includes(word), false, word)
+  })
+
+  test('a labels failure stops before compose', async () => {
+    const cases: [string, CommandResult[] | Result<CommandResult[]>, unknown][] = [
+      ['no such container', [{ name: 'labels', code: 1, lines: ['Error: No such object: cccccccccccc'] }],
+        { ok: false, problem: { kind: 'failed', message: 'Error: No such object: cccccccccccc' } }],
+      ['daemon down', [{ name: 'labels', code: 1, lines: ['Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?'] }],
+        { ok: false, problem: { kind: 'daemon-down', message: 'The Docker daemon is not running' } }],
+      ['no result', [], { ok: false, problem: { kind: 'failed', message: 'labels produced no result' } }],
+      ['another project', [{ name: 'labels', code: 0, lines: [labelsLine({ 'com.docker.compose.project': 'other' })] }], NOT_SHOP],
+      ['no labels', [{ name: 'labels', code: 0, lines: ['null'] }], NOT_SHOP],
+      ['a relative file', [{ name: 'labels', code: 0, lines: [labelsLine({ 'com.docker.compose.project.config_files': 'compose.yml' })] }], NO_FILES],
+      ['17 files', [{ name: 'labels', code: 0, lines: [labelsLine({
+        'com.docker.compose.project.config_files': Array.from({ length: 17 }, (_, i) => `/srv/${i}.yml`).join(','),
+      })] }], NO_FILES],
+      ['a dir with a newline', [{ name: 'labels', code: 0, lines: [labelsLine({ 'com.docker.compose.project.working_dir': '/srv\n/shop' })] }], NO_FILES],
+    ]
+    for (const [label, answer, expected] of cases) {
+      const results = answer as CommandResult[]
+      const local = setup()
+      local.setLocal(results)
+      assert.deepEqual(await local.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS), expected, `local ${label}`)
+      assert.deepEqual(local.log.localRuns.map((r) => r.commands.map((c) => c.name)), [['labels']], `local ${label}`)
+      const remote = setup()
+      remote.setSsh({ ok: true, value: results })
+      assert.deepEqual(await remote.service.composeAction('ssh:A', 'shop', MEMBER, 'stop', OPTIONS), expected, `ssh ${label}`)
+      assert.deepEqual(remote.log.sshRuns.map((r) => r.commands.map((c) => c.name)), [['labels']], `ssh ${label}`)
+    }
+    const problem = { kind: 'ssh-failed' as const, message: 'No ssh host named "A" on this Mac.' }
+    const t = setup()
+    t.setSsh({ ok: false, problem })
+    assert.deepEqual(await t.service.composeAction('ssh:A', 'shop', MEMBER, 'restart', OPTIONS), { ok: false, problem })
+    assert.equal(t.log.sshRuns.length, 1)
+  })
+
+  test('a compose failure is classified; a compose run cut off over ssh stays unknown-result', async () => {
+    const answer = (compose: CommandResult | undefined) => byName({ labels: LABELS_OK, ...(compose ? { compose } : {}) })
+    const t = setup()
+    t.setLocal(answer({ name: 'compose', code: 1, lines: ['Error response from daemon: Cannot restart container shop-web-1: boom'] }))
+    assert.deepEqual(await t.service.composeAction('local', 'shop', MEMBER, 'restart', OPTIONS),
+      { ok: false, problem: { kind: 'failed', message: 'Cannot restart container shop-web-1: boom' } })
+    const none = setup()
+    none.setLocal(answer(undefined))
+    assert.deepEqual(await none.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS),
+      { ok: false, problem: { kind: 'failed', message: 'compose produced no result' } })
+    const unknown = { kind: 'unknown-result' as const, message: 'sent; result unknown' }
+    const cut = setup()
+    cut.setSsh((commands) => (commands.some((c) => c.name === 'compose') ? { ok: false, problem: unknown } : { ok: true, value: [LABELS_OK] }))
+    assert.deepEqual(await cut.service.composeAction('ssh:A', 'shop', MEMBER, 'stop', OPTIONS), { ok: false, problem: unknown })
+  })
+
+  // A compose stopped by its own 55 s limit may have changed some of the project's containers and not others.
+  test('a compose that started and hit its 55 s limit (code 124) is unknown-result; one never started is a timeout', async () => {
+    const UNKNOWN = { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } }
+    const TIMEOUT = { ok: false, problem: { kind: 'timeout', message: 'The command timed out' } }
+    for (const action of COMPOSE_ACTIONS) {
+      const local = setup()
+      local.setLocal(byName({ labels: LABELS_OK, compose: { name: 'compose', code: 124, lines: [' Container shop-web-1  Stopping'] } }))
+      assert.deepEqual(await local.service.composeAction('local', 'shop', MEMBER, action, OPTIONS), UNKNOWN, `local ${action}`)
+      // ssh: `timeout 55` ended it on the host and the script reported rc 124.
+      const remote = setup()
+      remote.setSsh((commands) => ({ ok: true, value: byName({ labels: LABELS_OK, compose: { name: 'compose', code: 124, lines: [] } })(commands) }))
+      assert.deepEqual(await remote.service.composeAction('ssh:A', 'shop', MEMBER, action, OPTIONS), UNKNOWN, `ssh ${action}`)
+      const skipped = setup()
+      skipped.setLocal(byName({ labels: LABELS_OK, compose: { name: 'compose', code: 124, lines: [], skipped: true } }))
+      assert.deepEqual(await skipped.service.composeAction('local', 'shop', MEMBER, action, OPTIONS), TIMEOUT, `skipped ${action}`)
+    }
+    // The labels lookup changes nothing: its 124 stays a timeout.
+    const labels = setup()
+    labels.setLocal([{ name: 'labels', code: 124, lines: [] }])
+    assert.deepEqual(await labels.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS), TIMEOUT)
+  })
+
+  // Through the real local runner, with a fake exec: the runner's own marks decide.
+  test('on this Mac, a compose cut off by its exec limit is unknown-result; one left no time before exec is a timeout', async () => {
+    const realLocal = (reply: (args: string[]) => { code: number; stdout: string; stderr: string; timedOut: boolean }, clock: { now: number }) => {
+      const execs: { args: string[]; timeoutMs: number }[] = []
+      const local = createLocalRunner({
+        exec: async (_file, args, o) => { execs.push({ args, timeoutMs: o.timeoutMs }); return reply(args) },
+        exists: (path) => path === '/usr/bin/docker', loginShellWhich: async () => null, now: () => clock.now,
+      })
+      const hosts = {
+        localHost: (): HostInfo => ({ id: 'local', label: 'This Mac', kind: 'local', status: 'ready' }),
+      } as unknown as Hosts
+      const unused = async () => { throw new Error('must not be called') }
+      const service = createService({
+        hosts, local, ssh: { run: unused }, cli: {} as OrcaCli, storage: { get: unused }, now: () => clock.now, openLocalTerminal: unused,
+      })
+      return { service, execs }
+    }
+    const labelsOut = { code: 0, stdout: `${labelsLine()}\n`, stderr: '', timedOut: false }
+    const cut = realLocal((args) => (args[0] === 'inspect' ? labelsOut : { code: 1, stdout: '', stderr: ' Container shop-web-1  Stopping\n', timedOut: true }), { now: 0 })
+    assert.deepEqual(await cut.service.composeAction('local', 'shop', MEMBER, 'stop', { deadline: 100_000 }),
+      { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } })
+    assert.deepEqual(cut.execs.map((e) => [e.args[0], e.timeoutMs]), [['inspect', 20_000], ['compose', 55_000]])
+    const clock = { now: 0 }
+    const late = realLocal(() => { clock.now = 100_000; return labelsOut }, clock)
+    assert.deepEqual(await late.service.composeAction('local', 'shop', MEMBER, 'stop', { deadline: 100_000 }),
+      { ok: false, problem: { kind: 'timeout', message: 'The command timed out' } })
+    assert.deepEqual(late.execs.map((e) => e.args[0]), ['inspect'])
+  })
+
+  // Compose prints progress first and its error last.
+  test('a failed compose shows its last meaningful output line; the kinds are decided as before', async () => {
+    const progress = [' Container shop-db-1  Starting', ' Container shop-db-1  Started', ' Container shop-web-1  Starting']
+    const error = 'Error response from daemon: driver failed programming external connectivity on endpoint shop-web-1: port is already allocated'
+    const compose: CommandResult = { name: 'compose', code: 1, lines: [...progress, error, ''] }
+    const local = setup()
+    local.setLocal(byName({ labels: LABELS_OK, compose }))
+    const expected = { ok: false, problem: { kind: 'failed', message: 'driver failed programming external connectivity on endpoint shop-web-1: port is already allocated' } }
+    assert.deepEqual(await local.service.composeAction('local', 'shop', MEMBER, 'start', OPTIONS), expected)
+    const remote = setup()
+    remote.setSsh((commands) => ({ ok: true, value: byName({ labels: LABELS_OK, compose })(commands) }))
+    assert.deepEqual(await remote.service.composeAction('ssh:A', 'shop', MEMBER, 'start', OPTIONS), expected)
+    const denied = setup()
+    denied.setLocal(byName({ labels: LABELS_OK, compose: { name: 'compose', code: 1, lines: ['permission denied while trying to connect to the Docker daemon socket', 'more'] } }))
+    const r = await denied.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS)
+    assert.equal(!r.ok && r.problem.kind, 'permission-denied')
+    // The labels lookup keeps the first line.
+    const labels = setup()
+    labels.setLocal([{ name: 'labels', code: 1, lines: ['Error: No such object: cccccccccccc', 'second'] }])
+    assert.deepEqual(await labels.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS),
+      { ok: false, problem: { kind: 'failed', message: 'Error: No such object: cccccccccccc' } })
+  })
+
+  // The docker CLI without the compose plugin ends with "See 'docker --help'", which says nothing on its own.
+  test('a host without the compose plugin is failed with a clear message, in both CLI wordings', async () => {
+    const MISSING = { ok: false, problem: { kind: 'failed', message: 'Docker Compose is not installed on this host (the docker compose plugin is missing).' } }
+    const outputs = [
+      ["docker: 'compose' is not a docker command.", "See 'docker --help'"],
+      ['unknown command "compose" for "docker"', '', "Run 'docker --help' for more information"],
+      ['docker: unknown command: docker compose', '', "Run 'docker --help' for more information"],
+      ["DOCKER: 'COMPOSE' IS NOT A DOCKER COMMAND.", 'See docker --help'],
+      ['Unknown Command "Compose" for "docker"'],
+    ]
+    for (const lines of outputs) {
+      const compose: CommandResult = { name: 'compose', code: 1, lines }
+      const local = setup()
+      local.setLocal(byName({ labels: LABELS_OK, compose }))
+      assert.deepEqual(await local.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS), MISSING, `local ${lines[0]}`)
+      const remote = setup()
+      remote.setSsh((commands) => ({ ok: true, value: byName({ labels: LABELS_OK, compose })(commands) }))
+      assert.deepEqual(await remote.service.composeAction('ssh:A', 'shop', MEMBER, 'down', OPTIONS), MISSING, `ssh ${lines[0]}`)
+    }
+    // Another unknown command or a plain failure is not taken for a missing plugin.
+    const other = setup()
+    other.setLocal(byName({ labels: LABELS_OK, compose: { name: 'compose', code: 1, lines: ['unknown command "stopp" for "docker compose"'] } }))
+    assert.deepEqual(await other.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS),
+      { ok: false, problem: { kind: 'failed', message: 'unknown command "stopp" for "docker compose"' } })
+  })
+
+  test('invalid input causes no run, on either host', async () => {
+    const t = setup()
+    for (const hostId of ['local', 'ssh:A'] as const) {
+      for (const project of BAD_PROJECTS) {
+        const r = await t.service.composeAction(hostId, project, MEMBER, 'stop', OPTIONS)
+        assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} project ${JSON.stringify(project)}`)
+      }
+      for (const member of BAD_MEMBERS) {
+        const r = await t.service.composeAction(hostId, 'shop', member, 'stop', OPTIONS)
+        assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} member ${JSON.stringify(member)}`)
+      }
+      for (const action of ['remove', 'up', 'kill', 'down -v', '', 'constructor', '__proto__']) {
+        const r = await t.service.composeAction(hostId, 'shop', MEMBER, action as ComposeAction, OPTIONS)
+        assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} action ${JSON.stringify(action)}`)
+      }
+    }
+    assert.deepEqual(t.calls, [])
+  })
+
+  test('a host that is not ready, or not known, runs nothing', async () => {
+    const t = setup({ status: 'unsupported' })
+    const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
+    assert.deepEqual(await t.service.composeAction('ssh:A', 'shop', MEMBER, 'stop', OPTIONS), unsupported)
+    assert.deepEqual(await t.service.composeAction('local', 'shop', MEMBER, 'stop', OPTIONS), unsupported)
+    assert.deepEqual(await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), unsupported)
+    assert.deepEqual(await t.service.composeUp('local', 'shop', MEMBER, FOCUS, OPTIONS), unsupported)
+    const unknown = setup()
+    const r = await unknown.service.composeAction('ssh:nope', 'shop', MEMBER, 'stop', OPTIONS)
+    assert.equal(!r.ok && r.problem.kind, 'invalid')
+    const up = await unknown.service.composeUp('ssh:nope', 'shop', MEMBER, null, OPTIONS)
+    assert.equal(!up.ok && up.problem.kind, 'invalid')
+    assert.deepEqual([...t.calls, ...unknown.calls], [])
+  })
+})
+
+describe('service: Compose up in a terminal', () => {
+  test('a local up looks up the labels, then opens a plugin terminal with compose up -d and the title, and switches to it', async () => {
+    const t = setup()
+    t.setLocal([LABELS_OK])
+    const r = await t.service.composeUp('local', 'shop', MEMBER, FOCUS, OPTIONS)
+    assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'proj' } })
+    assert.deepEqual(t.log.localRuns, [{ commands: [composeLabelsCommand(MEMBER)], options: OPTIONS }])
+    assert.deepEqual(t.log.localTerminals, [{ workspaceId: 'ws1', title: 'compose up: shop', command: shellCommand(composeUpArgv(SHOP)) }])
+    assert.equal(t.log.localTerminals[0]!.command,
+      'docker compose --project-directory /srv/shop -p shop -f /srv/shop/compose.yml -f /srv/shop/compose.gpu.yml up -d')
+    assert.deepEqual(t.log.anchors, [{ hostId: 'local', focus: FOCUS }])
+    assert.deepEqual(t.log.switched, [{ handle: 'local_term' }])
+    assert.deepEqual(t.log.order, ['anchor', 'local.run', 'switchTo'])
+    assert.equal(t.calls.includes('createTerminal'), false)
+  })
+
+  test('an SSH up on a Linux host: anchor, kernel, labels, then the plain command in an Orca terminal, remembered and switched to', async () => {
+    const t = setup({ anchor: { path: '/home/me/main' } })
+    t.setSsh({ ok: true, value: [LABELS_OK] })
+    const r = await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)
+    assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'main' } })
+    assert.deepEqual(t.log.sshRuns, [{ env: 'A', commands: [composeLabelsCommand(MEMBER)], options: OPTIONS }])
+    assert.deepEqual(t.log.created, [{
+      environment: 'A', worktreePath: '/home/me/main', title: 'compose up: shop', command: shellCommand(composeUpArgv(SHOP)), focus: true,
+    }])
+    assert.deepEqual(t.log.remembered, [{ hostId: 'ssh:A', path: '/home/me/main' }])
+    assert.deepEqual(t.log.switched, [{ environment: 'A', handle: 'term_1' }])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', 'createTerminal', 'remember', 'switchTo'])
+  })
+
+  test('an SSH up on a Darwin host types the macOS docker lookup', async () => {
+    const t = setup({ kernel: 'Darwin' })
+    t.setSsh({ ok: true, value: [LABELS_OK] })
+    assert.equal((await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)).ok, true)
+    assert.equal(t.log.created[0]?.command, shellCommand(macTerminalArgv(composeUpArgv(SHOP))))
+    const checked = setup({ kernel: null })
+    checked.setCheckKernel('Darwin')
+    checked.setSsh((commands) => ({ ok: true, value: byName({ labels: LABELS_OK })(commands) }))
+    assert.equal((await checked.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)).ok, true)
+    assert.deepEqual(checked.log.sshRuns.map((run) => run.commands.map((c) => c.name)), [[], ['labels']])
+    assert.equal(checked.log.created[0]?.command, shellCommand(macTerminalArgv(composeUpArgv(SHOP))))
+  })
+
+  test('up follows the Shell rules: host status, anchor, kernel check; a stored unsupported kernel runs nothing', async () => {
+    const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
+    const other = setup({ kernel: 'FreeBSD' })
+    assert.deepEqual(await other.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), unsupported)
+    assert.deepEqual([...other.log.sshRuns, ...other.log.created], [])
+    for (const missing of ['unreachable', 'no-workspace'] as const) {
+      const t = setup({ anchor: { missing } })
+      assert.deepEqual(await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS),
+        { ok: false, problem: { kind: missing, message: missing === 'unreachable' ? 'Orca could not reach this host.' : 'This host has no workspace.' } })
+      assert.deepEqual(await t.service.composeUp('local', 'shop', MEMBER, FOCUS, OPTIONS),
+        { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
+      assert.deepEqual(t.calls, [])
+    }
+    // A local anchor without a workspace id: nothing runs.
+    const noId = setup({ anchor: { path: '/w' } })
+    assert.deepEqual(await noId.service.composeUp('local', 'shop', MEMBER, FOCUS, OPTIONS),
+      { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
+    assert.deepEqual(noId.calls, [])
+    const problem = { kind: 'timeout' as const, message: 'The ssh session to "A" did not finish in time' }
+    const check = setup({ kernel: null })
+    check.setSsh({ ok: false, problem })
+    assert.deepEqual(await check.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), { ok: false, problem })
+    assert.deepEqual(check.log.sshRuns.map((run) => run.commands), [[]])
+    assert.deepEqual(check.log.created, [])
+  })
+
+  test('a labels failure opens no terminal', async () => {
+    const local = setup()
+    local.setLocal([{ name: 'labels', code: 0, lines: [labelsLine({ 'com.docker.compose.project': 'other' })] }])
+    assert.deepEqual(await local.service.composeUp('local', 'shop', MEMBER, FOCUS, OPTIONS), NOT_SHOP)
+    const remote = setup()
+    remote.setSsh({ ok: true, value: [{ name: 'labels', code: 0, lines: [labelsLine({ 'com.docker.compose.project.working_dir': 'relative' })] }] })
+    assert.deepEqual(await remote.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), NO_FILES)
+    const failed = setup()
+    failed.setSsh({ ok: true, value: [{ name: 'labels', code: 1, lines: ['Error: No such object: cccccccccccc'] }] })
+    const r = await failed.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)
+    assert.deepEqual(r, { ok: false, problem: { kind: 'failed', message: 'Error: No such object: cccccccccccc' } })
+    for (const t of [local, remote, failed]) {
+      assert.deepEqual([...t.log.created, ...t.log.localTerminals, ...t.log.switched, ...t.log.remembered], [])
+    }
+  })
+
+  test('invalid input opens no terminal and runs nothing, on either host', async () => {
+    const t = setup({ kernel: null })
+    for (const hostId of ['local', 'ssh:A'] as const) {
+      for (const project of BAD_PROJECTS) {
+        const r = await t.service.composeUp(hostId, project, MEMBER, FOCUS, OPTIONS)
+        assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} project ${JSON.stringify(project)}`)
+      }
+      for (const member of BAD_MEMBERS) {
+        const r = await t.service.composeUp(hostId, 'shop', member, FOCUS, OPTIONS)
+        assert.equal(!r.ok && r.problem.kind, 'invalid', `${hostId} member ${JSON.stringify(member)}`)
+      }
+    }
+    assert.deepEqual(t.calls, [])
+    assert.deepEqual(t.log.remembered, [])
+  })
+
+  // Review Focus 1: awkward but absolute label paths reach the terminal as single quoted words.
+  test('awkward paths from the labels stay single words in the typed command', async () => {
+    const dir = "/srv/my shop/it's $(id)"
+    const t = setup()
+    t.setSsh({ ok: true, value: [{ name: 'labels', code: 0, lines: [labelsLine({
+      'com.docker.compose.project.working_dir': dir, 'com.docker.compose.project.config_files': `${dir}/compose.yml`,
+    })] }] })
+    assert.equal((await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS)).ok, true)
+    assert.equal(t.log.created[0]?.command,
+      `docker compose --project-directory '/srv/my shop/it'\\''s $(id)' -p shop -f '/srv/my shop/it'\\''s $(id)/compose.yml' up -d`)
+  })
+
+  test('a CliError while opening is unreachable and nothing is remembered', async () => {
+    const t = setup()
+    t.setSsh({ ok: true, value: [LABELS_OK] })
+    t.failCreate(new CliError('cli_exec_failed', 'cannot reach'))
+    assert.deepEqual(await t.service.composeUp('ssh:A', 'shop', MEMBER, null, OPTIONS), { ok: false, problem: { kind: 'unreachable', message: 'cannot reach' } })
+    assert.deepEqual([...t.log.remembered, ...t.log.switched], [])
+  })
+
+  test('the up title is the project, cut to 40 characters', async () => {
+    assert.equal(terminalTitle('compose up', 'shop'), 'compose up: shop')
+    const long = 'a'.repeat(63)
+    assert.equal(terminalTitle('compose up', long), `compose up: ${'a'.repeat(40)}…`)
+    const t = setup()
+    t.setLocal([{ name: 'labels', code: 0, lines: [labelsLine({ 'com.docker.compose.project': long })] }])
+    assert.equal((await t.service.composeUp('local', long, MEMBER, FOCUS, OPTIONS)).ok, true)
+    assert.equal(t.log.localTerminals[0]!.title, `compose up: ${'a'.repeat(40)}…`)
   })
 })
 

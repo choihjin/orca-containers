@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, describe, test } from 'orca/testing'
-import { actionCommand, InvalidInputError, logsCommand, removeCommand, SNAPSHOT_COMMANDS } from '../docker/commands'
+import { actionCommand, composeCommand, composeLabelsCommand, InvalidInputError, logsCommand, removeCommand, SNAPSHOT_COMMANDS } from '../docker/commands'
 import type { CommandResult } from '../docker/parse'
 import { MARK, sshScript } from './script'
 import {
@@ -363,6 +363,47 @@ describe('ssh runner', () => {
     assert.deepEqual(aborted, UNKNOWN, 'aborted after spawning')
     const overflow = await setup(() => ({ code: null, overflow: true, stdout: output(READY, BEGIN, marker('SEC', 'remove')) })).runner.run(ENV, [remove], OPTS)
     assert.deepEqual(overflow, UNKNOWN, 'overflow')
+  })
+
+  // Review Focus 3: a compose command cut off after the script could have reached it may have acted on the project.
+  test('a compose cut off after READY is unknown-result: timed out, aborted after spawning, overflow or a dropped connection', async () => {
+    const UNKNOWN = { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } }
+    const compose = composeCommand({ project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml'] }, 'stop')
+    const timedOut = await setup(() => ({ code: null, timedOut: true, stdout: output(READY) })).runner.run(ENV, [compose], OPTS)
+    assert.deepEqual(timedOut, UNKNOWN, 'timed out')
+    const timedOutEarly = await setup(() => ({ code: null, timedOut: true, stdout: '' })).runner.run(ENV, [compose], OPTS)
+    assert.deepEqual(timedOutEarly, UNKNOWN, 'timed out, nothing read')
+    const ctl = new AbortController()
+    const aborted = await setup(() => { ctl.abort(); return { code: 255, stdout: output(READY), stderr: 'Killed by signal 15.' } })
+      .runner.run(ENV, [compose], { deadline: 100_000, signal: ctl.signal })
+    assert.deepEqual(aborted, UNKNOWN, 'aborted after spawning')
+    const overflow = await setup(() => ({ code: null, overflow: true, stdout: output(READY, BEGIN, marker('SEC', 'compose')) })).runner.run(ENV, [compose], OPTS)
+    assert.deepEqual(overflow, UNKNOWN, 'overflow')
+    const dropped = await setup(() => ({ code: 255, stdout: output(READY, BEGIN, marker('SEC', 'compose')), stderr: 'client_loop: send disconnect: Broken pipe' }))
+      .runner.run(ENV, [compose], OPTS)
+    assert.deepEqual(dropped, UNKNOWN, 'dropped connection')
+    // Its script carries the 55 s limit; a complete run answers as usual.
+    const t = setup((call) => ({ stdout: complete({ name: 'compose', code: 0, lines: [] }), ...(call.input.includes('${T:+timeout 55} "$D" compose') ? {} : { code: 1 }) }))
+    assert.deepEqual(await t.runner.run(ENV, [compose], OPTS), { ok: true, value: [{ name: 'compose', code: 0, lines: [] }] })
+  })
+
+  test('the labels lookup changes nothing: cut off, it is a timeout or a failure, never unknown-result', async () => {
+    const labels = composeLabelsCommand(ID)
+    const timedOut = await setup(() => ({ code: null, timedOut: true, stdout: output(READY, BEGIN) })).runner.run(ENV, [labels], OPTS)
+    assert.equal(timedOut.ok ? 'ok' : timedOut.problem.kind, 'timeout')
+    const dropped = await setup(() => ({ code: 255, stdout: output(READY, BEGIN, marker('SEC', 'labels')) })).runner.run(ENV, [labels], OPTS)
+    assert.equal(dropped.ok ? 'ok' : dropped.problem.kind, 'failed')
+    const overflow = await setup(() => ({ code: null, overflow: true, stdout: output(READY) })).runner.run(ENV, [labels], OPTS)
+    assert.equal(overflow.ok ? 'ok' : overflow.problem.kind, 'truncated')
+  })
+
+  test('a compose keeps its answer when nothing could have been sent', async () => {
+    const compose = composeCommand({ project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml'] }, 'down')
+    const pure = await setup(() => ({ code: 255, stderr: 'ssh: Could not resolve hostname gpu1: nodename nor servname provided' }))
+      .runner.run(ENV, [compose], OPTS)
+    assert.equal(pure.ok ? 'ok' : pure.problem.kind, 'ssh-failed')
+    const other = await setup(() => ({ code: null, timedOut: true, stdout: output(marker('READY', 'FreeBSD')) })).runner.run(ENV, [compose], OPTS)
+    assert.equal(other.ok ? 'ok' : other.problem.kind, 'unsupported')
   })
 
   test('an action keeps its answer when nothing could have been sent', async () => {

@@ -1,4 +1,4 @@
-// `orca plugin check` renders the panel once per scenario. Every scenario stubs all eight worker
+// `orca plugin check` renders the panel once per scenario. Every scenario stubs all ten worker
 // requests, so check never reaches the worker's docker or Orca CLI calls. The log view opens only on a
 // press and nothing a scenario seeds can open it, so no scenario draws it. The selection is not persisted
 // either, so no scenario draws a details card or a delete question.
@@ -64,6 +64,8 @@ function stubs(hosts: HostInfo[], snap: Stubs['docker.snapshot']): Stubs {
     'docker.openTerminal': () => ({ ok: true, value: { opened: true, workspace: 'orca-docker' } }),
     'docker.removeResource': () => ({ ok: true, value: { done: true } }),
     'docker.pullTerminal': () => ({ ok: true, value: { opened: true, workspace: 'orca-docker' } }),
+    'docker.composeAction': () => ({ ok: true, value: { done: true } }),
+    'docker.composeUp': () => ({ ok: true, value: { opened: true, workspace: 'orca-docker' } }),
     'docker.logs': () => ({
       ok: true,
       value: { lines: ['/docker-entrypoint.sh: Configuration complete; ready for start up', 'GET / HTTP/1.1 200'], takenAt: Date.now() },

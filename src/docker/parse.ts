@@ -1,6 +1,9 @@
 import type { ContainerRow, ContainerState, HostId, ImageRow, NetworkRow, Problem, Result, Snapshot, VolumeRow } from '../protocol'
+import { COMPOSE_FILES_MAX, isComposePath, isComposeProject, type ComposeTarget } from './commands'
 
-export type CommandResult = { name: string; code: number; lines: string[] } // 원격: stdout+stderr 합침, 로컬: stdout 뒤 stderr
+// 원격: stdout+stderr 합침, 로컬: stdout 뒤 stderr. skipped: the local runner never started it (no time left before exec,
+// or the run was aborted); its code is 124.
+export type CommandResult = { name: string; code: number; lines: string[]; skipped?: true }
 
 const LABEL_MAX = 200
 const STATES: readonly ContainerState[] = ['created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead']
@@ -44,7 +47,9 @@ function composeLabel(row: Json, key: 'project' | 'service'): string {
 // Docker's own lead-in, dropped from a failed message so the reason survives the 200-character cut.
 const DAEMON_PREFIX = 'Error response from daemon: '
 
-export function classifyFailure(result: CommandResult): Problem {
+// The kinds come from the code and the whole text. The message of any other failure is the first meaningful line
+// (non-empty, not JSON), or with `from` 'last' the last one: compose prints its progress first and its error last.
+export function classifyFailure(result: CommandResult, from: 'first' | 'last' = 'first'): Problem {
   const text = result.lines.join('\n').toLowerCase()
   if (result.code === 124) return { kind: 'timeout', message: 'The command timed out' }
   if (result.code === 127 || text.includes('command not found')) return { kind: 'docker-missing', message: 'Docker was not found' }
@@ -52,9 +57,10 @@ export function classifyFailure(result: CommandResult): Problem {
   if (text.includes('cannot connect to the docker daemon') || text.includes('is the docker daemon running')) {
     return { kind: 'daemon-down', message: 'The Docker daemon is not running' }
   }
-  const first = result.lines.find((line) => line.trim() !== '' && parseJsonLine(line) === null)?.trim()
-  if (first === undefined) return { kind: 'failed', message: `${result.name} failed with exit code ${result.code}` }
-  const reason = first.startsWith(DAEMON_PREFIX) ? first.slice(DAEMON_PREFIX.length) : first
+  const meaningful = result.lines.filter((line) => line.trim() !== '' && parseJsonLine(line) === null)
+  const picked = (from === 'last' ? meaningful[meaningful.length - 1] : meaningful[0])?.trim()
+  if (picked === undefined) return { kind: 'failed', message: `${result.name} failed with exit code ${result.code}` }
+  const reason = picked.startsWith(DAEMON_PREFIX) ? picked.slice(DAEMON_PREFIX.length) : picked
   return { kind: 'failed', message: cleanLabel(reason, LABEL_MAX) }
 }
 
@@ -90,4 +96,23 @@ export function buildSnapshot(hostId: HostId, takenAt: number, results: readonly
   const volumes: VolumeRow[] = volumeRows.map((r) => ({ name: str(r, 'Name'), driver: str(r, 'Driver') }))
   const networks: NetworkRow[] = networkRows.map((r) => ({ id: str(r, 'ID'), name: str(r, 'Name'), driver: str(r, 'Driver'), scope: str(r, 'Scope') }))
   return { ok: true, value: { hostId, takenAt, serverVersion: str(server, 'Version'), containers, images, volumes, networks } }
+}
+
+
+// The answer of `docker inspect --format '{{json .Config.Labels}}' <member>`: one JSON object (a label value with a
+// newline stays on its line, escaped). It must name the requested project exactly and record an absolute working
+// directory and 1 to 16 absolute config files, none over 1024 characters or with a control character. Lines that are
+// not a JSON object (warnings) are ignored.
+export function parseComposeTarget(project: string, lines: readonly string[]): ComposeTarget | Problem {
+  const notMember: Problem = { kind: 'failed', message: `This container is not part of Compose project ${cleanLabel(project, 63)}` }
+  const objects = parseRows(lines)
+  const labels = objects.length === 1 ? objects[0] : undefined
+  if (labels === undefined || !isComposeProject(project) || labels['com.docker.compose.project'] !== project) return notMember
+  const noFiles: Problem = { kind: 'failed', message: "Compose did not record where this project's files are" }
+  const dir = labels['com.docker.compose.project.working_dir']
+  const joined = labels['com.docker.compose.project.config_files']
+  if (typeof dir !== 'string' || typeof joined !== 'string' || !isComposePath(dir)) return noFiles
+  const files = joined.split(',')
+  if (files.length > COMPOSE_FILES_MAX || !files.every(isComposePath)) return noFiles
+  return { project, dir, files }
 }

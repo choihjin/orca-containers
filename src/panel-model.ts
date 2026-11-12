@@ -309,6 +309,39 @@ export function resourceDetails(lists: Omit<Lists, 'containers'>, key: string, l
   return null
 }
 
+// The card of a selected Compose project, from all of its containers in the rows, whatever the filter shows.
+export type ProjectDetails = {
+  key: string
+  name: string
+  items: KeyValueItem[]
+  // What its actions send as `memberId`: the project's first container in the rows. Its labels tell the worker
+  // where the project's files are.
+  memberId: string
+  // Start: some container is not running. Stop and Restart: some container runs. Up and Down always apply.
+  canStart: boolean
+  canStop: boolean
+}
+
+const PROJECT_KEY = 'project:'
+
+export function projectDetails(rows: readonly ContainerRow[], key: string, lang: Lang = 'en'): ProjectDetails | null {
+  if (!key.startsWith(PROJECT_KEY)) return null
+  const name = key.slice(PROJECT_KEY.length)
+  // '' is the project of every container outside Compose.
+  const members = name === '' ? [] : rows.filter((r) => r.project === name)
+  const first = members[0]
+  if (first === undefined) return null
+  const { fields } = messages[lang]
+  const running = runningCount(members)
+  // As the tree labels them: a container without a service label stands for a service of its own.
+  const services = new Set(members.map((r) => r.service === '' ? r.name : r.service)).size
+  return {
+    key, name, memberId: first.id,
+    items: [{ label: fields.services, value: String(services) }, { label: fields.running, value: `${running} / ${members.length}` }],
+    canStart: running < members.length, canStop: running > 0,
+  }
+}
+
 function statusItem(row: ContainerRow, label: string): KeyValueItem {
   const item: KeyValueItem = { label, value: row.status }
   if (row.state === 'running') item.tone = 'success'

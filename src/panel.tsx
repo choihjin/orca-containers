@@ -6,22 +6,23 @@ import { isImageRef } from './docker/commands'
 import { messages, resolveLang, type Lang, type Messages } from './i18n'
 import {
   allowedActions, containerDetails, containerTree, dueForRefresh, hostOptions, imageTree, logRefreshMs, logText, networkTree, nextHost,
-  problemCopy, refreshMs, rejectionProblem, resourceDetails, resourceKindOf, runningCount, shownKey, volumeTree, type Allowed,
-  type ResourceDetails,
+  problemCopy, projectDetails, refreshMs, rejectionProblem, resourceDetails, resourceKindOf, runningCount, shownKey, volumeTree, type Allowed,
+  type ProjectDetails, type ResourceDetails,
 } from './panel-model'
 import {
-  REQUEST_TIMEOUT_MS, type ContainerAction, type ContainerRow, type FocusContext, type HostId, type HostInfo, type Problem, type ResourceKind,
-  type Result, type Snapshot, type TerminalKind,
+  REQUEST_TIMEOUT_MS, type ComposeAction, type ContainerAction, type ContainerRow, type FocusContext, type HostId, type HostInfo, type Problem,
+  type ResourceKind, type Result, type Snapshot, type TerminalKind,
 } from './protocol'
 
 // What the panel shows for the selected host: the last snapshot it applied, the problem of the
 // latest answer, and whether the latest request is still out (the in-flight flag).
 type HostView = { hostId: HostId; snapshot: Snapshot | null; problem: Problem | null; loading: boolean }
-// The item an action, its result or a delete question belongs to: a container id, an image, volume or network
-// tree key, or PULL_ROW. The card (or the pull row) draws only its own.
+// The item an action, its result or a delete question belongs to: a container id, a Compose project, image, volume
+// or network tree key, or PULL_ROW. The card (or the pull row) draws only its own.
 type Target = { hostId: HostId; id: string }
-// `ref` is what the delete sends: the container id, or the image reference or id, volume name or network id.
-type PendingDelete = Target & { name: string; kind: 'container' | ResourceKind; ref: string }
+// A delete question, or a Compose project's Down question (kind `project`). `ref` is what the delete sends: the
+// container id, the image reference or id, volume name or network id; for a project, its name.
+type PendingDelete = Target & { name: string; kind: 'container' | 'project' | ResourceKind; ref: string }
 // The log view under the card: its container, the cleaned text of the last answer it applied (null: none
 // yet), the problem of the latest answer, and whether its logs are still on the way.
 type LogView = Target & { text: string | null; takenAt: number | null; problem: Problem | null; loading: boolean }
@@ -32,13 +33,14 @@ const hostList = atom<HostInfo[] | null>(null)
 const hostsProblem = atom<Problem | null>(null)
 const hostsLoading = atom(false)
 const hostView = atom<HostView | null>(null)
-// A tree key: a container id, or an image tag, volume or network row. Group rows are never selected.
+// A tree key: a container id, a Compose project row, or an image tag, volume or network row. Repository rows are
+// never selected.
 const selection = atom<string | null>(null)
 const pendingDelete = atom<PendingDelete | null>(null)
 const working = atom(false)
 // Both clear on the next action or a host change.
 const actionProblem = atom<(Target & { problem: Problem }) | null>(null)
-// "Opened logs in <workspace>." after a Logs, Shell or Pull tab opened in the background; drawn in the language shown.
+// "Opened logs in <workspace>." after a Logs, Shell, Pull or Up tab opened in the background; drawn in the language shown.
 const openedNote = atom<(Target & { text: (m: Messages) => string }) | null>(null)
 // Open for the selected container only: it follows the selection and closes when the selection clears.
 const logView = atom<LogView | null>(null)
@@ -145,15 +147,22 @@ async function refreshSnapshot(): Promise<void> {
   if (selected !== null && !shownKey(answer.value, read(filterText), selected)) clearSelection()
   const pending = read(pendingDelete)
   if (pending !== null && !stillRemovable(answer.value, pending)) set(pendingDelete, null)
+  // A problem or note goes with its item: one that comes back under the same key (a project brought up again, a
+  // volume made again) starts clean. An item the filter only hides keeps them; the pull row is no item.
+  const gone = (owner: Target | null) => owner !== null && owner.id !== PULL_ROW && !shownKey(answer.value, '', owner.id)
+  if (gone(read(actionProblem))) set(actionProblem, null)
+  if (gone(read(openedNote))) set(openedNote, null)
 }
 
-// A container must still be there in a state that allows removing it (it may have started running); an image,
-// volume or network must still be there under its key and be deleted by the same reference.
+// A container must still be there in a state that allows removing it (it may have started running); a Compose
+// project must still have a container; an image, volume or network must still be there under its key and be
+// deleted by the same reference.
 function stillRemovable(snapshot: Snapshot, pending: PendingDelete): boolean {
   if (pending.kind === 'container') {
     const pinned = snapshot.containers.find((c) => c.id === pending.id)
     return pinned !== undefined && allowedActions(pinned.state).remove
   }
+  if (pending.kind === 'project') return projectDetails(snapshot.containers, pending.id) !== null
   const details = resourceDetails(snapshot, pending.id)
   return details !== null && details.removeBlocked === null && details.removeRef === pending.ref
 }
@@ -261,6 +270,26 @@ function pullImage(hostId: HostId, targetId: string, ref: string): Promise<void>
     ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedPull(ref, workspace) }))
 }
 
+// Start, Stop, Restart or Down for the whole project, as one compose command in the panel, then the host is read
+// again. `memberId` comes from the rows shown now (see projectDetails).
+function projectAction(hostId: HostId, key: string, action: ComposeAction): Promise<void> {
+  const project = projectOf(key)
+  if (project === null) return Promise.resolve()
+  const { name, memberId } = project
+  return runCommand({ hostId, id: key }, () =>
+    plugin.request('docker.composeAction', { hostId, project: name, memberId, action }, DOCKER_REQUEST), true)
+}
+
+// Opens `docker compose … up -d` in a terminal on the host, as Pull does (it may pull or build for long), and says where.
+function composeUp(hostId: HostId, key: string): Promise<void> {
+  const project = projectOf(key)
+  if (project === null) return Promise.resolve()
+  const { name, memberId } = project
+  const target = { hostId, id: key }
+  return runCommand(target, () => plugin.request('docker.composeUp', { hostId, project: name, memberId }, DOCKER_REQUEST), false,
+    ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedComposeUp(name, workspace) }))
+}
+
 // The same rule the worker applies; a refused name stays in the field with an error under it, and nothing is sent.
 function pullByName(hostId: HostId): void {
   const ref = read(pullText).trim()
@@ -348,11 +377,12 @@ function confirmDelete(): void {
   if (pinned === null) return
   set(pendingDelete, null)
   if (pinned.kind === 'container') void containerAction(pinned.hostId, 'remove', pinned.id)
+  else if (pinned.kind === 'project') void projectAction(pinned.hostId, pinned.id, 'down')
   else void removeResource(pinned.hostId, pinned.id, pinned.kind, pinned.ref)
 }
 
 // The selection, a pending delete and the log view change together: a delete question never outlives its
-// card, and an open log view switches to the container picked next, or closes for an image, volume or network.
+// card, and an open log view switches to the container picked next, or closes for anything else.
 function changeSelection(next: string): void {
   if (next === read(selection)) return
   set(selection, next)
@@ -376,7 +406,9 @@ function changeFilter(text: string): void {
   if (selected !== null && (snapshot === null || !shownKey(snapshot, text, selected))) clearSelection()
 }
 
-const SECTION_OF: Record<PendingDelete['kind'], Section> = { container: 'containers', image: 'images', volume: 'volumes', network: 'networks' }
+const SECTION_OF: Record<PendingDelete['kind'], Section> = {
+  container: 'containers', project: 'containers', image: 'images', volume: 'volumes', network: 'networks',
+}
 
 function setSectionOpen(section: Section, open: boolean): void {
   update(sectionsOpen, (before) => ({ ...SECTIONS_OPEN, ...before, [section]: open }))
@@ -396,9 +428,15 @@ function toggleRepo(key: string, expanded: boolean): void {
 }
 
 // Tree keys are container ids, `image:`, `volume:` and `network:` rows, and the group rows `project:<name>` and
-// `repo:<name>`. Only a container or one of those rows is picked (a group row toggles); only a container opens anything.
+// `repo:<name>`. A container, one of those rows or a project is picked (a group row also toggles); only a container
+// opens its logs.
 function containerOf(key: string): ContainerRow | null {
   return read(hostView)?.snapshot?.containers.find((c) => c.id === key) ?? null
+}
+
+function projectOf(key: string): ProjectDetails | null {
+  const rows = read(hostView)?.snapshot?.containers ?? null
+  return rows === null ? null : projectDetails(rows, key)
 }
 
 function resourceOf(key: string): ResourceDetails | null {
@@ -406,10 +444,13 @@ function resourceOf(key: string): ResourceDetails | null {
   return snapshot === null ? null : resourceDetails(snapshot, key)
 }
 
+// A click on a project row toggles it, as before, and now also selects the project, which opens its card.
 function pickItem(key: string): void {
   if (containerOf(key) !== null || resourceOf(key) !== null) changeSelection(key)
-  else if (key.startsWith('project:')) toggleProject(key, read(collapsedProjects).includes(key))
-  else if (key.startsWith('repo:')) toggleRepo(key, !read(expandedRepos).includes(key))
+  else if (key.startsWith('project:')) {
+    toggleProject(key, read(collapsedProjects).includes(key))
+    if (projectOf(key) !== null) changeSelection(key)
+  } else if (key.startsWith('repo:')) toggleRepo(key, !read(expandedRepos).includes(key))
 }
 
 // Enter or a double click: the container becomes the selected one and its log view opens under its card,
@@ -563,6 +604,57 @@ function resourceCard(view: HostView, details: ResourceDetails): OrcaNode {
   )
 }
 
+// Down stops and removes the project's containers and networks, so it asks first, as Delete does.
+function downQuestion(project: string, busy: boolean): OrcaNode {
+  const m = messages[uiLang()]
+  return (
+    <Callout key="confirm" tone="danger">
+      <Stack gap="sm">
+        <Text>{m.downQuestion(project)}</Text>
+        <Row gap="xs">
+          <Button key="confirm-down" tone="danger" disabled={busy} onPress={confirmDelete}>{m.down}</Button>
+          <Button key="cancel-down" variant="ghost" onPress={() => set(pendingDelete, null)}>{m.cancel}</Button>
+        </Row>
+      </Stack>
+    </Callout>
+  )
+}
+
+// The card of the selected Compose project: Start, Stop and Restart act on the whole project in the panel, Up opens
+// its terminal, and Down asks first.
+function projectCard(view: HostView, project: ProjectDetails): OrcaNode {
+  const m = messages[uiLang()]
+  const busy = read(working)
+  const { key, name } = project
+  // Down never goes out on one press: only confirmDelete sends it.
+  const act = (action: Exclude<ComposeAction, 'down'>) => () => void projectAction(view.hostId, key, action)
+  const askDown = () => set(pendingDelete, { hostId: view.hostId, id: key, name, kind: 'project', ref: name })
+  const own = ownedBy(view.hostId, key)
+  const pending = own(read(pendingDelete))
+  const problem = own(read(actionProblem))?.problem ?? null
+  const opened = noteText(own(read(openedNote)), m)
+  return (
+    <Card key="details" title={name}>
+      <Stack gap="sm">
+        <KeyValue items={project.items} />
+        <Row gap="sm" align="center" wrap>
+          <Toolbar label={m.projectActions}>
+            <Button key="project-start" size="sm" icon="play" disabled={busy || !project.canStart} onPress={act('start')}>{m.start}</Button>
+            <Button key="project-stop" size="sm" icon="stop" disabled={busy || !project.canStop} onPress={act('stop')}>{m.stop}</Button>
+            <Button key="project-restart" size="sm" icon="refresh" disabled={busy || !project.canStop} onPress={act('restart')}>{m.restart}</Button>
+            <Button key="project-up" size="sm" icon="upload" disabled={busy} onPress={() => void composeUp(view.hostId, key)}>{m.up}</Button>
+            <Button key="project-down" size="sm" icon="delete" tone="danger" variant="outline" disabled={busy} onPress={askDown}>{m.down}</Button>
+          </Toolbar>
+          {busy ? <Spinner label={m.working} /> : null}
+        </Row>
+        {opened === null ? null : <Text muted size="sm">{opened}</Text>}
+        {pending === null ? null : downQuestion(name, busy)}
+        {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
+      </Stack>
+    </Card>
+  )
+}
+
 // Before any lines: the problem or a placeholder. After: the lines, under the problem of a later failed refresh.
 function logBody(logs: LogView): OrcaNode {
   const m = messages[uiLang()]
@@ -614,6 +706,7 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
   const items = containerTree(rows, filter, lang)
   const selected = read(selection)
   const container = rows.find((c) => c.id === selected) ?? null
+  const project = selected === null || container !== null ? null : projectDetails(rows, selected, lang)
   const logs = read(logView)
   const ownLogs = logs !== null && container !== null && logs.hostId === view.hostId && logs.id === container.id ? logs : null
   const collapsed = read(collapsedProjects)
@@ -626,6 +719,8 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
           items={items}
           maxHeight="lg"
           // '' keeps the Tree controlled when no container is selected; undefined would let it keep its own pick.
+          // A selected project is not handed over either: Orca's Tree sends onSelect only for a row other than the
+          // one it shows selected, so a project row shown selected would stop toggling on a click.
           selected={container?.id ?? ''}
           expanded={items.filter((item) => item.children !== undefined && !collapsed.includes(item.key)).map((item) => item.key)}
           onSelect={({ key }) => pickItem(key)}
@@ -634,6 +729,7 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
         />
       )}
       {container === null ? null : detailsCard(view, container)}
+      {project === null ? null : projectCard(view, project)}
       {container === null || ownLogs === null ? null : logSection(view, container, ownLogs)}
     </Stack>
   )

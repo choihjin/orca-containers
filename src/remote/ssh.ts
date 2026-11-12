@@ -182,8 +182,8 @@ export function createSshRunner(deps: SshRunnerDeps): SshRunner {
       const run = extractRun(lines, nonce)
       // We ended it (deadline or abort), not ssh; its stderr and exit code then say nothing about ssh.
       const stopped = out.timedOut || options.signal?.aborted === true
-      // Once the script could have reached it, an unfinished action or remove may have been carried out.
-      const maybeSent = !run.complete && commands.some((c) => c.name === 'action' || c.name === 'remove')
+      // Once the script could have reached it, an unfinished action, remove or compose may have been carried out.
+      const maybeSent = !run.complete && commands.some((c) => c.name === 'action' || c.name === 'remove' || c.name === 'compose')
         && (ready !== null || stopped || out.overflow === true)
       if (out.overflow) return maybeSent ? unknownResult() : fail('truncated', `The output from "${env}" passed ${SSH_STDOUT_MAX / 1024 / 1024} MiB`)
       if (ready) {

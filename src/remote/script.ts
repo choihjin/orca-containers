@@ -1,7 +1,14 @@
-import type { DockerCommand } from '../docker/commands'
+import { ownTimeoutSeconds, type DockerCommand } from '../docker/commands'
 import { shellCommand } from '../platform'
 
 export const MARK = '__CTR_'
+
+// `$T` is `timeout 20` when the host has `timeout`, else empty. A command with its own limit (compose: 55 s) gets
+// `${T:+timeout <n>}`: `timeout <n>` when `timeout` exists, nothing otherwise.
+function limitWord(command: DockerCommand): string {
+  const seconds = ownTimeoutSeconds(command)
+  return seconds === undefined ? '$T' : `\${T:+timeout ${seconds}}`
+}
 
 // BEGIN, one SEC ... RC section per command, END; `$M` and `$N` are set before. Each docker call reads /dev/null.
 function runBody(commands: readonly DockerCommand[], candidates: readonly string[]): string[] {
@@ -13,10 +20,11 @@ function runBody(commands: readonly DockerCommand[], candidates: readonly string
     ...dockerFallback(candidates),
     'echo "${M}BEGIN_${N}__ $(ts)"',
   ]
-  for (const { name, argv } of commands) {
+  for (const command of commands) {
+    const { name, argv } = command
     lines.push(
       `echo "\${M}SEC_\${N}__ ${name}"`,
-      `if [ -n "$D" ]; then $T "$D" ${shellCommand(argv)} </dev/null 2>&1; rc ${name} $?; else echo "docker: command not found"; rc ${name} 127; fi`,
+      `if [ -n "$D" ]; then ${limitWord(command)} "$D" ${shellCommand(argv)} </dev/null 2>&1; rc ${name} $?; else echo "docker: command not found"; rc ${name} 127; fi`,
     )
   }
   lines.push('echo "${M}END_${N}__ $(ts)"')

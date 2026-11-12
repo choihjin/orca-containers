@@ -43,16 +43,24 @@ export type Messages = {
   composeRunning: (running: number, total: number) => string
   tags: (count: number) => string
   // Card keys.
-  fields: { image: string; status: string; ports: string; compose: string; id: string; size: string; created: string; driver: string; scope: string }
+  fields: {
+    image: string; status: string; ports: string; compose: string; id: string; size: string; created: string; driver: string; scope: string
+    // A Compose project's card: how many services, and how many of its containers run.
+    services: string; running: string
+  }
   // Card toolbars and buttons.
   containerActions: string
   resourceActions: Record<ResourceKind, string>
+  projectActions: string
   start: string
   stop: string
   restart: string
   logs: string
   shell: string
   pull: string
+  // Compose's own up and down, on a project's card.
+  up: string
+  down: string
   delete: string
   cancel: string
   working: string
@@ -64,9 +72,12 @@ export type Messages = {
   removeVolume: string
   removeNetwork: string
   builtInNetwork: string
-  // Where a Logs, Shell or Pull tab opened (in the background).
+  // The Down question: what Down removes and what it keeps.
+  downQuestion: (project: string) => string
+  // Where a Logs, Shell, Pull or Up tab opened (in the background).
   openedTerminal: Record<TerminalKind, (workspace: string) => string>
   openedPull: (ref: string, workspace: string) => string
+  openedComposeUp: (project: string, workspace: string) => string
   // The log view.
   logsUpdated: string
   refreshLogs: string
@@ -106,15 +117,19 @@ const en: Messages = {
   tags: (count) => `${count} ${count === 1 ? 'tag' : 'tags'}`,
   fields: {
     image: 'Image', status: 'Status', ports: 'Ports', compose: 'Compose', id: 'ID', size: 'Size', created: 'Created', driver: 'Driver', scope: 'Scope',
+    services: 'Services', running: 'Running',
   },
   containerActions: 'Container actions',
   resourceActions: { image: 'Image actions', volume: 'Volume actions', network: 'Network actions' },
+  projectActions: 'Compose project actions',
   start: 'Start',
   stop: 'Stop',
   restart: 'Restart',
   logs: 'Logs',
   shell: 'Shell',
   pull: 'Pull',
+  up: 'Up',
+  down: 'Down',
   delete: 'Delete',
   cancel: 'Cancel',
   working: 'Working',
@@ -125,11 +140,13 @@ const en: Messages = {
   removeVolume: 'The volume and its data are removed from the host. This cannot be undone.',
   removeNetwork: 'The network is removed from the host. This cannot be undone.',
   builtInNetwork: "Docker's built-in networks cannot be deleted.",
+  downQuestion: (project) => `Down ${project}: stops and removes its containers and networks. Volumes and images are kept.`,
   openedTerminal: {
     logs: (workspace) => `Opened logs in ${workspace}.`,
     shell: (workspace) => `Opened shell in ${workspace}.`,
   },
   openedPull: (ref, workspace) => `Opened pull: ${ref} in ${workspace}.`,
+  openedComposeUp: (project, workspace) => `Opened compose up: ${project} in ${workspace}.`,
   logsUpdated: 'Logs updated ',
   refreshLogs: 'Refresh logs',
   closeLogs: 'Close logs',
@@ -154,7 +171,7 @@ const en: Messages = {
   },
 }
 
-// Plain 합니다체, as in README.ko.md. Docker, SSH, Compose, Pull and Shell stay in English.
+// Plain 합니다체, as in README.ko.md. Docker, SSH, Compose, Pull, Shell, Up and Down stay in English.
 const ko: Messages = {
   host: '호스트',
   chooseHost: '호스트 선택',
@@ -181,15 +198,19 @@ const ko: Messages = {
   tags: (count) => `태그 ${count}개`,
   fields: {
     image: '이미지', status: '상태', ports: '포트', compose: 'Compose', id: 'ID', size: '크기', created: '생성', driver: '드라이버', scope: '범위',
+    services: '서비스', running: '실행 중',
   },
   containerActions: '컨테이너 작업',
   resourceActions: { image: '이미지 작업', volume: '볼륨 작업', network: '네트워크 작업' },
+  projectActions: 'Compose 프로젝트 작업',
   start: '시작',
   stop: '중지',
   restart: '재시작',
   logs: '로그',
   shell: 'Shell',
   pull: 'Pull',
+  up: 'Up',
+  down: 'Down',
   delete: '삭제',
   cancel: '취소',
   working: '작업 중',
@@ -200,11 +221,13 @@ const ko: Messages = {
   removeVolume: '호스트에서 볼륨을 데이터와 함께 삭제합니다. 되돌릴 수 없습니다.',
   removeNetwork: '호스트에서 네트워크를 삭제합니다. 되돌릴 수 없습니다.',
   builtInNetwork: 'Docker 기본 네트워크는 삭제할 수 없습니다.',
+  downQuestion: (project) => `${project} Down: 프로젝트의 컨테이너를 중지하고, 컨테이너와 네트워크를 삭제합니다. 볼륨과 이미지는 그대로 둡니다.`,
   openedTerminal: {
     logs: (workspace) => `${workspace}에 로그 터미널을 열었습니다.`,
     shell: (workspace) => `${workspace}에 Shell을 열었습니다.`,
   },
   openedPull: (ref, workspace) => `${workspace}에 ${ref} Pull 터미널을 열었습니다.`,
+  openedComposeUp: (project, workspace) => `${workspace}에 ${project} compose up 터미널을 열었습니다.`,
   logsUpdated: '로그 갱신 ',
   refreshLogs: '로그 새로고침',
   closeLogs: '로그 닫기',

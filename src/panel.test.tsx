@@ -51,6 +51,8 @@ function requests(overrides: MockRequests = {}): MockRequests {
     'docker.logs': ({ containerId }) => ok({ lines: [`${containerId} started`, `${containerId} ready`], takenAt: 2_000 }),
     'docker.removeResource': () => ok({ done: true as const }),
     'docker.pullTerminal': () => ok({ opened: true as const, workspace: 'proj' }),
+    'docker.composeAction': () => ok({ done: true as const }),
+    'docker.composeUp': () => ok({ opened: true as const, workspace: 'proj' }),
     ...overrides,
   }
 }
@@ -225,11 +227,11 @@ test('keeps a collapsed project collapsed and shows new projects expanded', asyn
   clean(v)
 })
 
-test('selecting a container shows its details card; a project row selects nothing', async () => {
+test('selecting a container shows its details card; a project row shows the project card instead', async () => {
   const v = await open(composeOnLocal)
   assert.equal(card(v), null)
   await v.selectItem(CONTAINERS, 'project:shop')
-  assert.equal(card(v), null)
+  assert.equal(card(v)?.label, 'shop')
   assert.equal(v.valueOf(CONTAINERS), '')
   assert.deepEqual(enabled(v), [])
 
@@ -245,15 +247,18 @@ test('selecting a container shows its details card; a project row selects nothin
     { label: 'ID', value: SHOP_WEB, code: true },
   ])
 
-  // A project row keeps the container that was selected.
+  // A project row takes the selection: its card replaces the container's.
   await v.selectItem(CONTAINERS, 'project:shop')
-  assert.equal(v.valueOf(CONTAINERS), SHOP_WEB)
-  assert.equal(card(v)?.label, 'shop-web-1')
+  assert.equal(v.valueOf(CONTAINERS), '')
+  assert.equal(card(v)?.label, 'shop')
   assert.equal(v.findAll({ type: 'Card' }).length, 1)
   clean(v)
 })
 
-test('selecting a group row toggles it and keeps the selected container and its card', async () => {
+// Orca's Tree sends onSelect only for a row other than the one it shows selected (the test kit sends it on every
+// selectItem). So the Tree is never told a project row is selected: every click on the row still reaches the panel
+// and toggles it, while the panel's own selection holds the project and draws its card.
+test('selecting a project row toggles it and selects the project, on every click', async () => {
   const v = await open(composeOnLocal)
   const expandedProp = () => v.find(CONTAINERS)?.props.expanded
   await v.selectItem(CONTAINERS, SHOP_WEB)
@@ -262,12 +267,21 @@ test('selecting a group row toggles it and keeps the selected container and its 
   await v.selectItem(CONTAINERS, 'project:shop')
   assert.equal(v.host.callsOf('plugin.request').length, before) // the click sent no request
   assert.deepEqual(expandedProp(), [])
-  assert.equal(v.valueOf(CONTAINERS), SHOP_WEB)
-  assert.equal(card(v)?.label, 'shop-web-1')
+  assert.equal(v.find(CONTAINERS)?.props.selected, '')
+  assert.equal(card(v)?.label, 'shop')
   await v.selectItem(CONTAINERS, 'project:shop')
   assert.deepEqual(expandedProp(), ['project:shop'])
-  assert.equal(v.valueOf(CONTAINERS), SHOP_WEB)
-  assert.equal(card(v)?.label, 'shop-web-1')
+  assert.equal(v.find(CONTAINERS)?.props.selected, '')
+  assert.equal(card(v)?.label, 'shop')
+  // The arrow only toggles.
+  await v.collapse(CONTAINERS, 'project:shop')
+  assert.deepEqual(expandedProp(), [])
+  assert.equal(card(v)?.label, 'shop')
+  // A container takes the selection back.
+  await v.selectItem(CONTAINERS, WEB)
+  assert.equal(v.valueOf(CONTAINERS), WEB)
+  assert.equal(card(v)?.label, 'web')
+  assert.equal(v.host.callsOf('plugin.request').length, before)
   clean(v)
 })
 
@@ -1716,6 +1730,428 @@ test('the same image tagged in two repositories is deleted by the reference of t
   clean(v)
 })
 
+// Compose projects: a project row's card acts on the whole project.
+const SHOP = 'project:shop'
+const PROJECT_BUTTONS = ['project-start', 'project-stop', 'project-restart', 'project-up', 'project-down']
+const projectEnabled = (v: TestPanel) => PROJECT_BUTTONS.filter((id) => v.find({ testId: id })?.disabled === false)
+const DOWN_SHOP = 'Down shop: stops and removes its containers and networks. Volumes and images are kept.'
+const UP_NOTE = 'Opened compose up: shop in proj.'
+// The shop project with its web and db containers in these states, and one container of its own. In the rows web
+// comes first; the tree sorts db first.
+const shopRows = (web: ContainerState, db: ContainerState): ContainerRow[] => [
+  container(SHOP_WEB, 'shop-web-1', web, { project: 'shop', service: 'web' }),
+  container(SHOP_DB, 'shop-db-1', db, { project: 'shop', service: 'db' }),
+  container(WEB, 'web', 'running'),
+]
+const composeSent = (v: TestPanel, name = 'docker.composeAction') => sent(v, name).map((c) => [c.input, c.timeoutMs])
+
+test('the project card: its name, services and running count, and the project actions', async () => {
+  const v = await open(composeOnLocal)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(card(v)?.label, 'shop')
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [{ label: 'Services', value: '2' }, { label: 'Running', value: '1 / 2' }])
+  assert.equal(v.find({ type: 'Toolbar' })?.label, 'Compose project actions')
+  assert.deepEqual(PROJECT_BUTTONS.map((id) => v.find({ testId: id })?.text), ['Start', 'Stop', 'Restart', 'Up', 'Down'])
+  assert.deepEqual(projectEnabled(v), PROJECT_BUTTONS)
+  // No container buttons and no log view.
+  assert.deepEqual(enabled(v), [])
+  assert.equal(v.find(LOGS), null)
+  // Picking sends nothing.
+  for (const name of ['docker.composeAction', 'docker.composeUp', 'docker.action', 'docker.logs']) assert.equal(sent(v, name).length, 0, name)
+  clean(v)
+})
+
+test('Start needs a container that is not running, Stop and Restart one that runs; Up and Down are always on', async () => {
+  let rows = shopRows('running', 'running')
+  const v = await open({ 'docker.snapshot': ({ hostId }) => ok(snap(hostId, rows)) })
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.deepEqual(projectEnabled(v), ['project-stop', 'project-restart', 'project-up', 'project-down'])
+  const cases: [ContainerState, ContainerState, string[]][] = [
+    ['exited', 'created', ['project-start', 'project-up', 'project-down']],
+    ['running', 'exited', PROJECT_BUTTONS],
+    ['paused', 'exited', ['project-start', 'project-up', 'project-down']],
+  ]
+  for (const [web, db, expected] of cases) {
+    rows = shopRows(web, db)
+    await v.press({ label: 'Refresh' })
+    assert.equal(card(v)?.label, 'shop')
+    assert.deepEqual(projectEnabled(v), expected, `${web} ${db}`)
+  }
+  clean(v)
+})
+
+test('Start, Stop and Restart send the project and its first container in the rows, then read the host again', async () => {
+  let rows = shopRows('running', 'exited')
+  let during: unknown
+  const v = await open({
+    'docker.snapshot': ({ hostId }) => ok(snap(hostId, rows)),
+    'docker.composeAction': async () => {
+      await nextTurn()
+      during = { enabled: projectEnabled(view!), spinner: view!.find({ type: 'Spinner', label: 'Working' }) !== null }
+      return ok({ done: true as const })
+    },
+  })
+  await v.selectItem(CONTAINERS, SHOP)
+  const expected: unknown[] = []
+  for (const action of ['start', 'stop', 'restart'] as const) {
+    const snapshots = sent(v, 'docker.snapshot').length
+    during = undefined // each press must record its own
+    await v.press({ testId: `project-${action}` })
+    expected.push([{ hostId: 'local', project: 'shop', memberId: SHOP_WEB, action }, 110_000])
+    assert.deepEqual(composeSent(v), expected)
+    assert.equal(sent(v, 'docker.snapshot').length, snapshots + 1, action)
+    assert.deepEqual(during, { enabled: [], spinner: true }, action)
+  }
+  // The member is taken from the rows shown now.
+  rows = [container(SHOP_DB, 'shop-db-1', 'exited', { project: 'shop', service: 'db' }), container(WEB, 'web', 'running')]
+  await v.press({ label: 'Refresh' })
+  await v.press({ testId: 'project-start' })
+  assert.deepEqual(composeSent(v).at(-1), [{ hostId: 'local', project: 'shop', memberId: SHOP_DB, action: 'start' }, 110_000])
+  assert.deepEqual(projectEnabled(v), PROJECT_BUTTONS.filter((id) => id !== 'project-stop' && id !== 'project-restart'))
+  for (const name of ['docker.action', 'docker.composeUp']) assert.equal(sent(v, name).length, 0, name)
+  clean(v)
+})
+
+test('the project card goes when the project has no containers left', async () => {
+  let rows = COMPOSE
+  const v = await open({ 'docker.snapshot': ({ hostId }) => ok(snap(hostId, rows)) })
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(card(v)?.label, 'shop')
+  rows = [container(WEB, 'web', 'running')]
+  await v.press({ label: 'Refresh' })
+  assert.deepEqual(keysOf(v), [WEB])
+  assert.equal(card(v), null)
+  // Back again, it is not selected.
+  rows = COMPOSE
+  await v.press({ label: 'Refresh' })
+  assert.equal(card(v), null)
+  clean(v)
+})
+
+test("clicking a project row closes a container's log view, and no more logs are asked for", async () => {
+  mock.timers.enable({ apis: ['setInterval', 'Date'] })
+  const v = await open(composeOnLocal)
+  const count = () => sent(v, 'docker.logs').length
+  await v.selectItem(CONTAINERS, SHOP_WEB)
+  await v.press({ testId: 'logs' })
+  assert.ok(v.find(LOGS))
+  assert.equal(count(), 1)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(card(v)?.label, 'shop')
+  assert.equal(v.find(LOGS), null)
+  assert.equal(v.find({ label: 'Close logs' }), null)
+  mock.timers.tick(30_000)
+  await v.settled()
+  assert.equal(count(), 1)
+  // Back on the container, the log view stays closed.
+  await v.selectItem(CONTAINERS, SHOP_WEB)
+  assert.equal(v.find(LOGS), null)
+  mock.timers.tick(30_000)
+  await v.settled()
+  assert.equal(count(), 1)
+  clean(v)
+})
+
+test('under a filter that shows only some of its containers, the project still sends its first container in the rows', async () => {
+  const v = await open(composeOnLocal)
+  await v.type(FILTER, 'db')
+  // The tree shows the project with only shop-db-1; the rows list shop-web-1 first.
+  assert.deepEqual(keysOf(v), [SHOP, SHOP_DB])
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [{ label: 'Services', value: '2' }, { label: 'Running', value: '1 / 2' }])
+  await v.press({ testId: 'project-start' })
+  assert.deepEqual(composeSent(v), [[{ hostId: 'local', project: 'shop', memberId: SHOP_WEB, action: 'start' }, 110_000]])
+  clean(v)
+})
+
+test("a project that comes back under the same name starts without the old project's problem or note", async () => {
+  let rows = COMPOSE
+  const v = await open({
+    'docker.snapshot': ({ hostId }) => ok(snap(hostId, rows)),
+    'docker.composeAction': () => ({ ok: false, problem: { kind: 'unknown-result', message: 'cut off' } }),
+  })
+  const unknown = () => v.find({ label: 'Result unknown' })
+  const comeAndGo = async () => {
+    rows = [container(WEB, 'web', 'running')]
+    await v.press({ label: 'Refresh' })
+    rows = COMPOSE
+    await v.press({ label: 'Refresh' })
+  }
+  // Selected when it goes.
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-restart' })
+  assert.ok(unknown(), v.summary().join('\n'))
+  // A refresh that still lists the project keeps its problem.
+  await v.press({ label: 'Refresh' })
+  assert.ok(unknown())
+  await comeAndGo()
+  assert.equal(card(v), null)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(unknown(), null)
+
+  // Not selected when it goes.
+  await v.press({ testId: 'project-restart' })
+  await v.selectItem(CONTAINERS, WEB)
+  await comeAndGo()
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(unknown(), null)
+
+  // The note of an Up likewise.
+  await v.press({ testId: 'project-up' })
+  assert.ok(v.find({ text: UP_NOTE }))
+  await comeAndGo()
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(v.find({ text: UP_NOTE }), null)
+  clean(v)
+})
+
+test('a problem stays with an item the filter hides, and the pull row keeps its note across refreshes', async () => {
+  let pgdataThere = true
+  const v = await openResources({
+    'docker.snapshot': ({ hostId }) => {
+      const base = resourceSnap(hostId)
+      return ok(pgdataThere ? base : { ...base, volumes: [] })
+    },
+    'docker.removeResource': () => ({ ok: false, problem: { kind: 'failed', message: 'volume is in use' } }),
+  })
+  await v.selectItem(VOLUMES, PGDATA)
+  await v.press({ testId: 'delete' })
+  await v.press({ testId: 'confirm-delete' })
+  assert.ok(v.find({ text: 'volume is in use' }))
+  // Hidden by the filter, still on the host: its problem waits for it.
+  await v.type(FILTER, 'nginx')
+  await v.press({ label: 'Refresh' })
+  await v.type(FILTER, '', { replace: true })
+  await v.selectItem(VOLUMES, PGDATA)
+  assert.ok(v.find({ text: 'volume is in use' }), v.summary().join('\n'))
+  // Gone and back: it starts clean.
+  pgdataThere = false
+  await v.press({ label: 'Refresh' })
+  pgdataThere = true
+  await v.press({ label: 'Refresh' })
+  await v.selectItem(VOLUMES, PGDATA)
+  assert.equal(v.find({ text: 'volume is in use' }), null)
+
+  await v.type(PULL_INPUT, 'redis:7')
+  await v.press(PULL_BY_NAME)
+  await v.press({ label: 'Refresh' })
+  assert.ok(v.find({ text: 'Opened pull: redis:7 in proj.' }), v.summary().join('\n'))
+  clean(v)
+})
+
+test('Down takes two presses, says what it removes and keeps, and sends down', async () => {
+  let rows = COMPOSE
+  const v = await open({
+    'docker.snapshot': ({ hostId }) => ok(snap(hostId, rows)),
+    'docker.composeAction': ({ action }) => {
+      if (action === 'down') rows = rows.filter((r) => r.project !== 'shop')
+      return ok({ done: true as const })
+    },
+  })
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-down' })
+  assert.ok(v.find({ text: DOWN_SHOP }), v.summary().join('\n'))
+  assert.match(v.find({ type: 'Callout' })?.text ?? '', /^Down shop: stops and removes its containers and networks\. Volumes and images are kept\./)
+  assert.equal(v.find({ type: 'Callout' })?.props.tone, 'danger')
+  assert.deepEqual([v.find({ testId: 'confirm-down' })?.text, v.find({ testId: 'cancel-down' })?.text], ['Down', 'Cancel'])
+  assert.equal(sent(v, 'docker.composeAction').length, 0)
+
+  await v.press({ testId: 'cancel-down' })
+  assert.equal(v.find({ text: DOWN_SHOP }), null)
+  assert.equal(sent(v, 'docker.composeAction').length, 0)
+
+  await v.press({ testId: 'project-down' })
+  const snapshots = sent(v, 'docker.snapshot').length
+  await v.press({ testId: 'confirm-down' })
+  assert.deepEqual(composeSent(v), [[{ hostId: 'local', project: 'shop', memberId: SHOP_WEB, action: 'down' }, 110_000]])
+  assert.equal(sent(v, 'docker.snapshot').length, snapshots + 1)
+  // The project is gone from the host: its row, its card and the question go.
+  assert.deepEqual(keysOf(v), [WEB])
+  assert.equal(card(v), null)
+  assert.equal(v.find({ text: DOWN_SHOP }), null)
+  for (const name of ['docker.action', 'docker.removeResource', 'docker.composeUp']) assert.equal(sent(v, name).length, 0, name)
+  clean(v)
+})
+
+test('the pending Down clears when the selection, the host, the filter or the section changes, and survives a refresh', async () => {
+  const v = await open(composeOnLocal)
+  const question = () => v.find({ text: DOWN_SHOP })
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-down' })
+  // A refresh that still lists the project keeps the question; so does another click on its row.
+  await v.press({ label: 'Refresh' })
+  assert.ok(question(), v.summary().join('\n'))
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.ok(question())
+
+  await v.selectItem(CONTAINERS, WEB)
+  assert.equal(question(), null)
+  assert.equal(v.find({ testId: 'confirm-down' }), null)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(question(), null)
+
+  await v.press({ testId: 'project-down' })
+  await v.select(HOST, 'ssh:GPU1')
+  await v.select(HOST, 'local')
+  assert.equal(card(v), null)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(question(), null)
+
+  // A filter that leaves the project a container keeps the card and the question; one that hides it clears both.
+  await v.press({ testId: 'project-down' })
+  await v.type(FILTER, 'db')
+  assert.equal(card(v)?.label, 'shop')
+  assert.ok(question())
+  await v.type(FILTER, 'zzz', { replace: true })
+  assert.equal(card(v), null)
+  await v.type(FILTER, '', { replace: true })
+  assert.equal(card(v), null)
+  assert.equal(question(), null)
+
+  // Closing the Containers section drops it; closing another section does not.
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-down' })
+  await v.toggle(section('Images'))
+  assert.ok(question())
+  await v.toggle(section('Containers'))
+  await v.toggle(section('Containers'))
+  assert.equal(card(v)?.label, 'shop')
+  assert.equal(question(), null)
+  assert.equal(sent(v, 'docker.composeAction').length, 0)
+  clean(v)
+})
+
+test('Up opens compose up in a terminal on the host and says where, until the next action', async () => {
+  const v = await open(composeOnLocal)
+  await v.selectItem(CONTAINERS, SHOP)
+  const snapshots = sent(v, 'docker.snapshot').length
+  await v.press({ testId: 'project-up' })
+  assert.deepEqual(composeSent(v, 'docker.composeUp'), [[{ hostId: 'local', project: 'shop', memberId: SHOP_WEB }, 110_000]])
+  assert.ok(v.find({ text: UP_NOTE }), v.summary().join('\n'))
+  // The terminal does the work, so the panel reads the host only on its own schedule, as after Pull.
+  assert.equal(sent(v, 'docker.snapshot').length, snapshots)
+  assert.equal(sent(v, 'docker.composeAction').length, 0)
+  // The note stays with its card.
+  await v.selectItem(CONTAINERS, WEB)
+  assert.equal(v.find({ text: UP_NOTE }), null)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.ok(v.find({ text: UP_NOTE }))
+  await v.press({ testId: 'project-stop' })
+  assert.equal(v.find({ text: UP_NOTE }), null)
+  clean(v)
+})
+
+test('an Up that cannot open its terminal says why on the project card', async () => {
+  const v = await open({ ...composeOnLocal, 'docker.composeUp': () => ({ ok: false, problem: { kind: 'no-workspace', message: 'none' } }) })
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-up' })
+  assert.ok(v.summary().includes('Callout danger "No workspace on this host"'), v.summary().join('\n'))
+  assert.equal(v.find({ text: /^Opened compose up/ }), null)
+  clean(v)
+})
+
+test("a compose action's problem shows on the project card, and the host is still read again", async () => {
+  const composeError = 'no configuration file provided: not found'
+  let answer: () => Result<{ done: true }> = () => ({ ok: false, problem: { kind: 'unknown-result', message: 'cut off' } })
+  const v = await open({ ...composeOnLocal, 'docker.composeAction': () => answer() })
+  await v.selectItem(CONTAINERS, SHOP)
+  const snapshots = sent(v, 'docker.snapshot').length
+  await v.press({ testId: 'project-restart' })
+  assert.ok(v.summary().includes('Callout danger "Result unknown"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: 'The command was sent, but its result did not come back. Refresh to check.' }))
+  assert.equal(sent(v, 'docker.snapshot').length, snapshots + 1)
+
+  answer = () => ({ ok: false, problem: { kind: 'failed', message: composeError } })
+  await v.press({ testId: 'project-stop' })
+  assert.ok(v.summary().includes('Callout danger "Command failed"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: composeError }))
+  assert.equal(v.find({ text: /^The command was sent/ }), null)
+
+  answer = () => { throw hostError('timeout', 'docker.composeAction took longer than 110000 ms') }
+  await v.press({ testId: 'project-down' })
+  await v.press({ testId: 'confirm-down' })
+  assert.ok(v.find({ text: 'timeout: docker.composeAction took longer than 110000 ms' }), v.summary().join('\n'))
+  assert.equal(card(v)?.label, 'shop')
+  assert.equal(sent(v, 'docker.snapshot').length, snapshots + 3)
+  // The problem belongs to the project's card.
+  await v.selectItem(CONTAINERS, WEB)
+  assert.equal(v.find({ type: 'Callout' }), null)
+  assert.deepEqual(v.errors, [])
+})
+
+test("a compose action's late answer shows only on the project card it was for", async () => {
+  let selecting: Promise<void> | undefined
+  let cardDuring: string | undefined
+  const v = await open({
+    ...composeOnLocal,
+    'docker.composeAction': async () => {
+      // The person picks a container while the project's Stop still runs.
+      selecting = view!.selectItem(CONTAINERS, WEB)
+      await nextTurn()
+      cardDuring = card(view!)?.label
+      return { ok: false, problem: { kind: 'failed', message: 'stop failed' } }
+    },
+  })
+  const failed = () => v.find({ label: 'Command failed' })
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-stop' })
+  await selecting
+  await v.settled()
+  assert.equal(cardDuring, 'web')
+  assert.equal(card(v)?.label, 'web')
+  assert.equal(failed(), null)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.ok(failed(), v.summary().join('\n'))
+  clean(v)
+})
+
+test("an Up's late note shows only on its card, and an answer that comes after a host change shows nowhere", async () => {
+  let duringUp: (() => Promise<void>) | null = () => view!.selectItem(CONTAINERS, WEB)
+  let acting: Promise<void> | undefined
+  const v = await open({
+    ...composeOnLocal,
+    'docker.composeUp': async () => {
+      acting = duringUp?.()
+      await nextTurn()
+      return ok({ opened: true as const, workspace: 'proj' })
+    },
+    'docker.composeAction': async () => {
+      acting = view!.select(HOST, 'ssh:GPU1')
+      await nextTurn()
+      return { ok: false, problem: { kind: 'failed', message: 'late' } }
+    },
+  })
+  await v.selectItem(CONTAINERS, SHOP)
+  await v.press({ testId: 'project-up' })
+  await acting
+  await v.settled()
+  assert.equal(card(v)?.label, 'web')
+  assert.equal(v.find({ text: /^Opened compose up/ }), null)
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.ok(v.find({ text: UP_NOTE }), v.summary().join('\n'))
+
+  // Up, then another host is picked before its answer comes.
+  duringUp = () => view!.select(HOST, 'ssh:GPU1')
+  await v.press({ testId: 'project-up' })
+  await acting
+  await v.settled()
+  assert.equal(v.valueOf(HOST), 'ssh:GPU1')
+  await v.select(HOST, 'local')
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(v.find({ text: /^Opened compose up/ }), null)
+
+  // A compose action likewise: its late failure is not drawn, and the host it was for is not read again for it.
+  await v.press({ testId: 'project-restart' })
+  await acting
+  await v.settled()
+  assert.equal(v.valueOf(HOST), 'ssh:GPU1')
+  assert.deepEqual(sent(v, 'docker.snapshot').map((c) => (c.input as { hostId: string }).hostId), ['local', 'ssh:GPU1', 'local', 'ssh:GPU1'])
+  await v.select(HOST, 'local')
+  await v.selectItem(CONTAINERS, SHOP)
+  assert.equal(v.find({ label: 'Command failed' }), null)
+  clean(v)
+})
+
 // Korean. The panel follows Orca's UI language unless its Language setting picks one; the copy comes from i18n.ts.
 
 const TEXT_PROPS = new Set(['label', 'title', 'description', 'placeholder'])
@@ -1984,6 +2420,33 @@ test('loading and working states in Korean', async () => {
   assert.deepEqual(during, [''])
   await v.select({ label: '호스트' }, 'ssh:GPU1')
   assert.deepEqual(loading, [''])
+  clean(v)
+})
+
+test('the project card in Korean: its fields, buttons, Down question, Up note and problems', async () => {
+  const v = await open({ ...composeOnLocal, 'docker.composeAction': () => ({ ok: false, problem: { kind: 'unknown-result', message: 'cut off' } }) }, {
+    locale: 'ko',
+  })
+  await v.selectItem(KO_CONTAINERS, SHOP)
+  assert.equal(card(v)?.label, 'shop')
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [{ label: '서비스', value: '2' }, { label: '실행 중', value: '1 / 2' }])
+  assert.equal(v.find({ type: 'Toolbar' })?.label, 'Compose 프로젝트 작업')
+  assert.deepEqual(PROJECT_BUTTONS.map((id) => v.find({ testId: id })?.text), ['시작', '중지', '재시작', 'Up', 'Down'])
+  assert.deepEqual(englishLeft(v), [])
+
+  await v.press({ testId: 'project-down' })
+  assert.ok(v.find({ text: 'shop Down: 프로젝트의 컨테이너를 중지하고, 컨테이너와 네트워크를 삭제합니다. 볼륨과 이미지는 그대로 둡니다.' }), v.summary().join('\n'))
+  assert.deepEqual([v.find({ testId: 'confirm-down' })?.text, v.find({ testId: 'cancel-down' })?.text], ['Down', '취소'])
+  assert.deepEqual(englishLeft(v), [])
+  await v.press({ testId: 'cancel-down' })
+
+  await v.press({ testId: 'project-up' })
+  assert.ok(v.find({ text: 'proj에 shop compose up 터미널을 열었습니다.' }), v.summary().join('\n'))
+  assert.deepEqual(englishLeft(v), [])
+
+  await v.press({ testId: 'project-restart' })
+  assert.ok(v.summary().includes('Callout danger "결과를 알 수 없습니다"'), v.summary().join('\n'))
+  assert.deepEqual(englishLeft(v), [])
   clean(v)
 })
 

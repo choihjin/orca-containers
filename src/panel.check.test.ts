@@ -4,8 +4,8 @@ import scenarios from './panel.check.ts'
 import * as panel from './panel'
 
 const REQUEST_NAMES = [
-  'docker.action', 'docker.logs', 'docker.openTerminal', 'docker.pullTerminal', 'docker.removeResource', 'docker.snapshot', 'hosts.list',
-  'hosts.matchFocus',
+  'docker.action', 'docker.composeAction', 'docker.composeUp', 'docker.logs', 'docker.openTerminal', 'docker.pullTerminal', 'docker.removeResource',
+  'docker.snapshot', 'hosts.list', 'hosts.matchFocus',
 ]
 
 let view: TestPanel | undefined
@@ -14,7 +14,7 @@ afterEach(async () => {
   view = undefined
 })
 
-test('every check scenario stubs exactly the eight worker requests', () => {
+test('every check scenario stubs exactly the ten worker requests', () => {
   assert.deepEqual(Object.keys(scenarios).sort(), ['daemonDown', 'empty', 'local', 'resources', 'ssh', 'sshFailed'])
   for (const [name, scenario] of Object.entries(scenarios)) {
     const stubs = scenario.requests ?? {}

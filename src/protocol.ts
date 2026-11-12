@@ -21,6 +21,7 @@ export type NetworkRow = { id: string; name: string; driver: string; scope: stri
 export type Snapshot = { hostId: HostId; takenAt: number; serverVersion: string; containers: ContainerRow[];
   images: ImageRow[]; volumes: VolumeRow[]; networks: NetworkRow[] }
 export type ContainerAction = 'start' | 'stop' | 'restart' | 'remove'
+export type ComposeAction = 'start' | 'stop' | 'restart' | 'down'
 export type TerminalKind = 'logs' | 'shell'
 export type ResourceKind = 'image' | 'volume' | 'network'
 export type FocusContext = { displayName: string; branch: string; terminalIds: string[] }
@@ -38,5 +39,10 @@ declare module 'orca' {
     'docker.removeResource': { input: { hostId: HostId; kind: ResourceKind; ref: string }; output: Result<{ done: true }> }
     // Opens `docker pull <ref>` in an Orca terminal, as Shell does: a large pull outlasts any panel request.
     'docker.pullTerminal': { input: { hostId: HostId; ref: string }; output: Result<Opened> }
+    // A Compose project's start, stop, restart or down, as one compose command in the panel. `memberId`: one of the
+    // project's containers, whose labels say where the project's files are. Down keeps volumes and images.
+    'docker.composeAction': { input: { hostId: HostId; project: string; memberId: string; action: ComposeAction }; output: Result<{ done: true }> }
+    // Opens `docker compose ... up -d` in an Orca terminal, as Pull does: it may pull or build for a long time.
+    'docker.composeUp': { input: { hostId: HostId; project: string; memberId: string }; output: Result<Opened> }
   }
 }

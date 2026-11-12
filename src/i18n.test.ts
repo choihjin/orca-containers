@@ -72,8 +72,8 @@ test('the ko catalog has a non-empty value for every en key, and no key en lacks
   }
 })
 
-// Product words Koreans use as they are, and the short id label.
-const SAME_IN_BOTH = ['ssh', 'shell', 'pull', 'fields.compose', 'fields.id']
+// Product words Koreans use as they are (Up and Down are Compose's own commands, as Pull is Docker's), and the short id label.
+const SAME_IN_BOTH = ['ssh', 'shell', 'pull', 'up', 'down', 'fields.compose', 'fields.id']
 
 test('every ko string differs from its en string, except the product words kept in English', () => {
   const kept: string[] = []
@@ -93,4 +93,11 @@ test('the en counts use the right plural', () => {
   assert.equal(messages.en.composeRunning(1, 2), 'compose · 1/2 running')
   assert.equal(messages.ko.tags(1), '태그 1개')
   assert.equal(messages.ko.runningOfTotal(1, 2), '2개 중 1개 실행 중')
+})
+
+test('the Compose project copy', () => {
+  assert.equal(messages.en.downQuestion('shop'), 'Down shop: stops and removes its containers and networks. Volumes and images are kept.')
+  assert.equal(messages.ko.downQuestion('shop'), 'shop Down: 프로젝트의 컨테이너를 중지하고, 컨테이너와 네트워크를 삭제합니다. 볼륨과 이미지는 그대로 둡니다.')
+  assert.equal(messages.en.openedComposeUp('shop', 'proj'), 'Opened compose up: shop in proj.')
+  assert.equal(messages.ko.openedComposeUp('shop', 'proj'), 'proj에 shop compose up 터미널을 열었습니다.')
 })

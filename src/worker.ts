@@ -2,11 +2,13 @@ import { existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import type { PluginRequests } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
+import { isComposeAction } from './docker/commands'
 import { createHosts, type LocalWorkspace } from './hosts'
 import { createLocalRunner, nodeLocalDeps, type LocalRunner } from './local/runner'
 import { localNameInText, resolveOrcaCliPath } from './platform'
 import {
-  WORK_BUDGET_MS, type ContainerAction, type FocusContext, type HostId, type Problem, type ResourceKind, type RunOptions, type TerminalKind,
+  WORK_BUDGET_MS, type ContainerAction, type FocusContext, type HostId, type Problem, type ResourceKind, type RunOptions,
+  type TerminalKind,
 } from './protocol'
 import { createOrcaCli, nodeExec, type OrcaCli } from './remote/orca-cli'
 import { createSshRunner, nodeSshExec, type KeyValueStore, type SshExec } from './remote/ssh'
@@ -185,6 +187,27 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
       return isString(o.ref) ? { input: { hostId: o.hostId, ref: o.ref } } : { error: 'ref must be a string.' }
     }, async (input, { service }, options) =>
       service.pullTerminal(input.hostId, input.ref, await readFocus(), options))
+
+    // Only the shape here; the service checks the project name and the member id.
+    register('docker.composeAction', (raw) => {
+      const o = obj(raw)
+      if (!o) return { error: NOT_OBJECT }
+      if (!isHostId(o.hostId)) return { error: BAD_HOST }
+      if (!isString(o.project)) return { error: 'project must be a string.' }
+      if (!isString(o.memberId)) return { error: 'memberId must be a string.' }
+      if (!isComposeAction(o.action)) return { error: 'action must be start, stop, restart or down.' }
+      return { input: { hostId: o.hostId, project: o.project, memberId: o.memberId, action: o.action } }
+    }, async (input, { service }, options) =>
+      service.composeAction(input.hostId, input.project, input.memberId, input.action, options))
+
+    register('docker.composeUp', (raw) => {
+      const o = obj(raw)
+      if (!o) return { error: NOT_OBJECT }
+      if (!isHostId(o.hostId)) return { error: BAD_HOST }
+      if (!isString(o.project)) return { error: 'project must be a string.' }
+      return isString(o.memberId) ? { input: { hostId: o.hostId, project: o.project, memberId: o.memberId } } : { error: 'memberId must be a string.' }
+    }, async (input, { service }, options) =>
+      service.composeUp(input.hostId, input.project, input.memberId, await readFocus(), options))
   }
 
   // Nothing to close (no terminal is kept open): the requests still running are stopped, and new ones answer timeout.

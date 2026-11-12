@@ -1,9 +1,9 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, describe, test } from 'orca/testing'
-import { actionCommand, logsCommand, SNAPSHOT_COMMANDS, type DockerCommand } from '../docker/commands'
+import { actionCommand, composeCommand, composeLabelsCommand, logsCommand, SNAPSHOT_COMMANDS, type DockerCommand } from '../docker/commands'
 import { shellCommand } from '../platform'
 import { extractRun, readyInfo } from './markers'
 import * as script from './script'
@@ -34,8 +34,18 @@ function withFakeHost<T>(kernel: string, body: (tmp: string) => T, docker = true
 }
 
 // The script on stdin of `<shell> -s`, as ssh hands it to the remote `sh -s`.
-const runOnStdin = (shell: string, script: string, tmp: string): string[] =>
-  execFileSync(`/bin/${shell}`, ['-s'], { input: script, env: { PATH: `${tmp}:/usr/bin:/bin` } }).toString().split('\n')
+const runOnStdin = (shell: string, script: string, tmp: string, path = `${tmp}:/usr/bin:/bin`): string[] =>
+  execFileSync(`/bin/${shell}`, ['-s'], { input: script, env: { PATH: path } }).toString().split('\n')
+
+// A PATH of the temp folder alone, with links to the two tools the script and the fake docker need besides the shell's
+// builtins: no real `timeout` (or docker) on this machine can be found through it.
+function shimOnlyPath(tmp: string): string {
+  for (const tool of ['cat', 'date']) {
+    const real = ['/bin', '/usr/bin'].map((dir) => join(dir, tool)).find((path) => existsSync(path))
+    if (real) symlinkSync(real, join(tmp, tool))
+  }
+  return tmp
+}
 
 const ID = 'a'.repeat(12)
 // Tests that run the script never let it reach this Mac's real docker.
@@ -65,6 +75,56 @@ describe('ssh script', () => {
     assert.equal(calls.length, SNAPSHOT_COMMANDS.length + 2)
     for (const line of calls) assert.match(line, /\$T "\$D" [^;]* <\/dev\/null 2>&1;/)
   })
+
+  // A compose command gets `timeout 55` where `timeout` exists; every other docker call keeps `timeout 20` ($T).
+  test('a compose call has its own 55 s limit and reads /dev/null; every other call keeps $T', () => {
+    const compose = composeCommand({ project: 'shop', dir: '/srv/my shop', files: ['/srv/my shop/compose.yml'] }, 'stop')
+    const text = sshScript(NONCE, [composeLabelsCommand(ID), compose, actionCommand('stop', ID)])
+    assert.ok(text.split('\n').includes('T=; if command -v timeout >/dev/null 2>&1; then T="timeout 20"; fi'), text)
+    const calls = text.split('\n').filter((l) => l.includes('"$D"') && !l.startsWith('if [ -z "$D" ]'))
+    assert.equal(calls.length, 3)
+    assert.match(calls[0] ?? '', /\$T "\$D" inspect [^;]* <\/dev\/null 2>&1; rc labels \$\?;/)
+    assert.match(calls[1] ?? '', /\$\{T:\+timeout 55\} "\$D" compose [^;]* <\/dev\/null 2>&1; rc compose \$\?;/)
+    assert.ok(calls[1]?.includes(`compose --project-directory '/srv/my shop' -p shop -f '/srv/my shop/compose.yml' stop </dev/null`), calls[1])
+    assert.match(calls[2] ?? '', /\$T "\$D" stop [^;]* <\/dev\/null 2>&1; rc action \$\?;/)
+  })
+
+  test('a per-command limit must be a whole number of seconds', () => {
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(() => sshScript(NONCE, [{ name: 'compose', argv: ['compose'], timeoutSeconds: bad }]), /timeoutSeconds/)
+    }
+  })
+
+  // A fake `timeout` on PATH notes its limit in `timeout-calls`, then runs the rest.
+  for (const shell of SHELLS) {
+    test(`with timeout on the host, compose runs under timeout 55 and the other commands under timeout 20 (${shell})`, () => {
+      withFakeHost('Linux', (tmp) => {
+        writeFileSync(join(tmp, 'timeout'), '#!/bin/sh\necho "$1" >> "${0%/*}/timeout-calls"\nshift\nexec "$@"\n')
+        chmodSync(join(tmp, 'timeout'), 0o755)
+        const compose = composeCommand({ project: 'shop', dir: '/srv/a b', files: ['/srv/a b/c.yml'] }, 'restart')
+        const out = runOnStdin(shell, sshScript(NONCE, [{ name: 'version', argv: ['--version'] }, compose, { name: 'ps', argv: ['ps'] }], NO_CANDIDATES), tmp)
+        assert.deepEqual(readFileSync(join(tmp, 'timeout-calls'), 'utf8'), '20\n55\n20\n')
+        assert.deepEqual(extractRun(out, NONCE).results, [
+          { name: 'version', code: 0, lines: ['--version'] },
+          { name: 'compose', code: 0, lines: compose.argv },
+          { name: 'ps', code: 0, lines: ['ps'] },
+        ])
+      })
+    })
+
+    test(`without timeout on the host, compose runs with no limit word (${shell})`, () => {
+      withFakeHost('Linux', (tmp) => {
+        const path = shimOnlyPath(tmp)
+        // Nothing named timeout is reachable, whatever this machine has in /usr/bin or /bin.
+        const found = execFileSync(`/bin/${shell}`, ['-c', 'command -v timeout || echo none'], { env: { PATH: path } }).toString()
+        assert.equal(found, 'none\n')
+        const compose = composeCommand({ project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml'] }, 'down')
+        const out = runOnStdin(shell, sshScript(NONCE, [compose], NO_CANDIDATES), tmp, path)
+        assert.deepEqual(extractRun(out, NONCE).results, [{ name: 'compose', code: 0, lines: compose.argv }])
+        assert.equal(existsSync(join(tmp, 'timeout-calls')), false)
+      })
+    })
+  }
 
   for (const shell of SHELLS) {
     test(`docker reading stdin does not consume the script (${shell})`, () => {

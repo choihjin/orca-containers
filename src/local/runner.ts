@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import type { DockerCommand } from '../docker/commands'
+import { ownTimeoutSeconds, type DockerCommand } from '../docker/commands'
 import type { CommandResult } from '../docker/parse'
 import { DOCKER_CANDIDATES, loginShellFor } from '../platform'
 import type { RunOptions } from '../protocol'
@@ -43,27 +43,31 @@ export function createLocalRunner(deps: LocalDeps): LocalRunner {
 
   return {
     async run(commands, options) {
+      const limits = commands.map(ownTimeoutSeconds) // a bad limit runs nothing, as in the ssh script
       const results: CommandResult[] = []
       let resolved: { path: string | null; skipped: boolean } | undefined // once per run
-      const timedOut = (name: string) => results.push({ name, code: 124, lines: [] })
-      for (const command of commands) {
+      // Never started: told apart from a command that ran and was cut off (exec timedOut, also 124).
+      const skip = (name: string) => results.push({ name, code: 124, lines: [], skipped: true })
+      for (const [index, command] of commands.entries()) {
         if (options.signal?.aborted || options.deadline - deps.now() <= 0) {
-          timedOut(command.name)
+          skip(command.name)
           continue
         }
         resolved ??= await resolveDocker(options.deadline - deps.now())
         // the lookup may have used up the budget, so look again before exec
         const remaining = options.deadline - deps.now()
         if (options.signal?.aborted || remaining <= 0 || resolved.skipped) {
-          timedOut(command.name)
+          skip(command.name)
           continue
         }
         if (resolved.path === null) {
           results.push({ name: command.name, code: 127, lines: ['docker: command not found'] })
           continue
         }
+        const seconds = limits[index]
+        const limitMs = seconds === undefined ? LOCAL_TIMEOUT_MS : seconds * 1000 // compose: 55 s
         const out = await deps.exec(resolved.path, command.argv, {
-          timeoutMs: Math.min(LOCAL_TIMEOUT_MS, remaining),
+          timeoutMs: Math.min(limitMs, remaining),
           ...(command.name === 'logs' ? { merge: true } : {}),
         })
         results.push({

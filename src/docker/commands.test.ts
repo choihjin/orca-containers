@@ -1,7 +1,8 @@
 import { assert, describe, test } from 'orca/testing'
-import type { ContainerAction, ResourceKind } from '../protocol'
+import type { ComposeAction, ContainerAction, ResourceKind } from '../protocol'
 import {
-  InvalidInputError, SNAPSHOT_COMMANDS, actionCommand, isContainerId, isImageRef, logsCommand, pullArgv, removeCommand, terminalArgv,
+  InvalidInputError, SNAPSHOT_COMMANDS, actionCommand, composeCommand, composeLabelsCommand, composeUpArgv, isComposeAction, isComposePath,
+  isComposeProject, isContainerId, isImageRef, logsCommand, pullArgv, removeCommand, terminalArgv, type ComposeTarget,
 } from './commands'
 
 const isInvalid = (e: unknown): boolean => e instanceof InvalidInputError
@@ -133,5 +134,104 @@ describe('docker commands', () => {
     assert.deepEqual(pullArgv(`name@${DIGEST}`), ['docker', 'pull', `name@${DIGEST}`])
     assert.deepEqual(pullArgv('localhost:5000/x'), ['docker', 'pull', 'localhost:5000/x'])
     for (const bad of [...HOSTILE, 'A'.repeat(256), 'nginx..latest', 'nginx@latest', DIGEST.replace(':', '@')]) refuses(() => pullArgv(bad), JSON.stringify(bad))
+  })
+
+  describe('compose', () => {
+    const ONE: ComposeTarget = { project: 'shop', dir: '/srv/shop', files: ['/srv/shop/compose.yml'] }
+    const TWO: ComposeTarget = { project: 'ml_2-x', dir: '/home/me/ml', files: ['/home/me/ml/compose.yml', '/home/me/ml/compose.gpu.yml'] }
+    const ACTIONS: readonly ComposeAction[] = ['start', 'stop', 'restart', 'down']
+
+    test('project names follow Compose\'s normalized form: a lowercase letter or digit, then up to 62 of [a-z0-9_-]', () => {
+      for (const good of ['shop', 'a', '0', 'ml_2-x', 'a'.repeat(63), 'orca-containers-test']) assert.equal(isComposeProject(good), true, good)
+      for (const bad of [...HOSTILE, 'a'.repeat(64), 'Shop', '_shop', '-shop', 'sh.op', 'sh/op', 'sh:op', 'shöp', 'shop\n']) {
+        assert.equal(isComposeProject(bad), false, JSON.stringify(bad))
+      }
+    })
+
+    test('compose actions are start, stop, restart and down only', () => {
+      for (const good of ACTIONS) assert.equal(isComposeAction(good), true, good)
+      for (const bad of ['remove', 'rm', 'up', 'kill', 'pause', 'down -v', '', 'constructor', 'toString', '__proto__']) {
+        assert.equal(isComposeAction(bad), false, bad)
+      }
+      // The worker checks raw request values with it.
+      for (const bad of [5, null, undefined, {}, ['stop'], true]) assert.equal(isComposeAction(bad), false, JSON.stringify(bad))
+    })
+
+    test('compose paths: absolute, at most 1024 characters, no control character, backslash or line separator', () => {
+      for (const good of ['/', '/srv/shop', `/${'a'.repeat(1023)}`, '/a b/c', "/it's", '/$(id)', '/a;b', '/-v', '/x/../y', '/ünï', '/a\u00a0b', '/a\u2027b', '/한글']) {
+        assert.equal(isComposePath(good), true, JSON.stringify(good))
+      }
+      for (const bad of [
+        '', 'srv/shop', './x', '-v', '--volumes', '~/x', `/${'a'.repeat(1024)}`, '/a\nb', '/a\u0000b', '/a\u001fb', '/a\u007fb', '/a\tb', ' /x',
+        '/a\\b', "/a\\'b", '/a\\', '/a\u0080b', '/a\u0085b', '/a\u009bb', '/a\u009fb', '/a\u2028b', '/a\u2029b',
+      ]) {
+        assert.equal(isComposePath(bad), false, JSON.stringify(bad))
+      }
+    })
+
+    test('the labels lookup is a fixed inspect of one member container', () => {
+      const id = 'f'.repeat(64)
+      assert.deepEqual(composeLabelsCommand(id), { name: 'labels', argv: ['inspect', '--format', '{{json .Config.Labels}}', id] })
+      for (const bad of ['web', 'x; reboot', '', '-f', 'A'.repeat(12), 'a'.repeat(11), 'a'.repeat(65)]) refuses(() => composeLabelsCommand(bad), bad)
+    })
+
+    test('compose argv is exact for every action, with one file and with several', () => {
+      for (const action of ACTIONS) {
+        assert.deepEqual(composeCommand(ONE, action), {
+          name: 'compose', timeoutSeconds: 55,
+          argv: ['compose', '--project-directory', '/srv/shop', '-p', 'shop', '-f', '/srv/shop/compose.yml', action],
+        }, action)
+        assert.deepEqual(composeCommand(TWO, action).argv, [
+          'compose', '--project-directory', '/home/me/ml', '-p', 'ml_2-x', '-f', '/home/me/ml/compose.yml', '-f', '/home/me/ml/compose.gpu.yml', action,
+        ], action)
+      }
+    })
+
+    test('down never removes volumes or images', () => {
+      const argv = composeCommand(TWO, 'down').argv
+      assert.equal(argv[argv.length - 1], 'down')
+      for (const word of ['-v', '--volumes', '--rmi', '--remove-orphans']) assert.equal(argv.includes(word), false, word)
+    })
+
+    test('up argv is docker compose ... up -d', () => {
+      assert.deepEqual(composeUpArgv(ONE), ['docker', 'compose', '--project-directory', '/srv/shop', '-p', 'shop', '-f', '/srv/shop/compose.yml', 'up', '-d'])
+      assert.deepEqual(composeUpArgv(TWO), [
+        'docker', 'compose', '--project-directory', '/home/me/ml', '-p', 'ml_2-x', '-f', '/home/me/ml/compose.yml', '-f', '/home/me/ml/compose.gpu.yml', 'up', '-d',
+      ])
+    })
+
+    // Review Focus 1: a path with spaces, quotes or shell syntax stays one argument after its flag.
+    test('awkward but absolute paths stay single arguments after their flags', () => {
+      const target: ComposeTarget = { project: 'shop', dir: "/srv/my shop/it's", files: ['/srv/$(id)/a;b.yml', '/srv/-v/c.yml'] }
+      assert.deepEqual(composeCommand(target, 'stop').argv, [
+        'compose', '--project-directory', "/srv/my shop/it's", '-p', 'shop', '-f', '/srv/$(id)/a;b.yml', '-f', '/srv/-v/c.yml', 'stop',
+      ])
+    })
+
+    test('compose refuses a bad action, project, directory or file list', () => {
+      for (const bad of ['remove', 'up', 'down -v', 'constructor', '__proto__', '']) refuses(() => composeCommand(ONE, bad as ComposeAction), bad)
+      const bads: [string, ComposeTarget][] = [
+        ['project', { ...ONE, project: 'Shop' }],
+        ['project option', { ...ONE, project: '-v' }],
+        ['relative dir', { ...ONE, dir: 'srv/shop' }],
+        ['option dir', { ...ONE, dir: '--volumes' }],
+        ['dir with a newline', { ...ONE, dir: '/srv\n/shop' }],
+        ['no files', { ...ONE, files: [] }],
+        ['17 files', { ...ONE, files: Array.from({ length: 17 }, (_, i) => `/srv/${i}.yml`) }],
+        ['relative file', { ...ONE, files: ['/srv/a.yml', 'b.yml'] }],
+        ['long file', { ...ONE, files: [`/${'a'.repeat(1024)}`] }],
+        ['file with a control character', { ...ONE, files: ['/srv/a\u0007.yml'] }],
+        ['dir with a backslash', { ...ONE, dir: '/srv/sh\\op' }],
+        ['file with a backslash and a quote', { ...ONE, files: ["/srv/a\\'b.yml"] }],
+        ['file with a C1 control', { ...ONE, files: ['/srv/a\u009b.yml'] }],
+        ['dir with U+2028', { ...ONE, dir: '/srv/\u2028x' }],
+        ['file with U+2029', { ...ONE, files: ['/srv/a.yml', '/srv/\u2029b.yml'] }],
+      ]
+      for (const [label, target] of bads) {
+        refuses(() => composeCommand(target, 'stop'), label)
+        refuses(() => composeUpArgv(target), `up ${label}`)
+      }
+      assert.equal(composeCommand({ ...ONE, files: Array.from({ length: 16 }, (_, i) => `/srv/${i}.yml`) }, 'stop').argv.length, 5 + 32 + 1)
+    })
   })
 })

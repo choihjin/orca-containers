@@ -3,8 +3,8 @@ import type { ContainerRow, ContainerState, HostInfo, ImageRow, NetworkRow, Prob
 import type { TreeItem } from 'orca'
 import {
   allowedActions, containerDetails, containerTree, defaultExpanded, dueForRefresh, hostOptions, imageTree, LOG_LINE_MAX, LOG_REFRESH_LOCAL_MS,
-  LOG_REFRESH_REMOTE_MS, LOG_TEXT_MAX, logRefreshMs, logText, matchesFilter, networkTree, nextHost, problemCopy, refreshMs, rejectionProblem,
-  resourceDetails, resourceKindOf, runningCount, shownKey, stateIcon, volumeTree,
+  LOG_REFRESH_REMOTE_MS, LOG_TEXT_MAX, logRefreshMs, logText, matchesFilter, networkTree, nextHost, problemCopy, projectDetails, refreshMs,
+  rejectionProblem, resourceDetails, resourceKindOf, runningCount, shownKey, stateIcon, volumeTree,
 } from './panel-model'
 
 const host = (id: HostInfo['id'], label: string, status: HostInfo['status']): HostInfo => ({ id, label, kind: id === 'local' ? 'local' : 'ssh', status })
@@ -415,6 +415,45 @@ test('no card for a key that is not an image, volume or network on this host', (
   }
 })
 
+// The rows as the host lists them: the project's first container in the rows is not the first in the tree.
+const PROJECT_ROWS = [
+  c('1'.repeat(12), 'loose', 'exited'),
+  c('2'.repeat(12), 'shop-web-1', 'running', { project: 'shop', service: 'web' }),
+  c('3'.repeat(12), 'shop-web-2', 'exited', { project: 'shop', service: 'web' }),
+  c('4'.repeat(12), 'shop-db-1', 'exited', { project: 'shop', service: 'db' }),
+  c('5'.repeat(12), 'blog-app-1', 'running', { project: 'blog', service: 'app' }),
+]
+
+test('a Compose project card: its services, how many containers run, its first container in the rows, and which actions apply', () => {
+  assert.deepEqual(projectDetails(PROJECT_ROWS, 'project:shop'), {
+    key: 'project:shop', name: 'shop', memberId: '2'.repeat(12),
+    items: [{ label: 'Services', value: '2' }, { label: 'Running', value: '1 / 3' }],
+    canStart: true, canStop: true,
+  })
+  // Start needs a container that is not running (paused counts); Stop and Restart need one that runs.
+  const project = (...states: ContainerState[]) =>
+    projectDetails(states.map((s, i) => c(String(i).repeat(12), `p-${i}`, s, { project: 'p', service: `s${i}` })), 'project:p')
+  assert.deepEqual([project('running', 'running')?.canStart, project('running', 'running')?.canStop], [false, true])
+  assert.deepEqual([project('exited', 'created')?.canStart, project('exited', 'created')?.canStop], [true, false])
+  assert.deepEqual([project('running', 'paused')?.canStart, project('running', 'paused')?.canStop], [true, true])
+  assert.deepEqual(project('paused')?.items, [{ label: 'Services', value: '1' }, { label: 'Running', value: '0 / 1' }])
+  // A container without a service label counts as a service of its own.
+  const unlabelled = projectDetails([c('6'.repeat(12), 'a', 'running', { project: 'p' }), c('7'.repeat(12), 'b', 'running', { project: 'p' })], 'project:p')
+  assert.deepEqual(unlabelled?.items[0], { label: 'Services', value: '2' })
+})
+
+test('no project card for a project with no containers, or for a key that is not a project row', () => {
+  for (const key of ['project:gone', 'project:', 'project:Shop', '2'.repeat(12), 'repo:shop', 'volume:shop', 'shop', '']) {
+    assert.equal(projectDetails(PROJECT_ROWS, key), null, key)
+  }
+  assert.equal(projectDetails([], 'project:shop'), null)
+})
+
+test('the project card in Korean: field names translated, the counts as they are', () => {
+  assert.deepEqual(projectDetails(PROJECT_ROWS, 'project:blog', 'ko')?.items, [{ label: '서비스', value: '1' }, { label: '실행 중', value: '1 / 1' }])
+  assert.deepEqual(projectDetails(PROJECT_ROWS, 'project:blog', 'en'), projectDetails(PROJECT_ROWS, 'project:blog'))
+})
+
 test('shownKey: whether the trees draw an item for this filter', () => {
   const shown = (filter: string, key: string) => shownKey(RESOURCES, filter, key)
   // Containers: grouped or not.
@@ -422,6 +461,11 @@ test('shownKey: whether the trees draw an item for this filter', () => {
   assert.equal(shown('zeta', 'c'.repeat(64)), true)
   assert.equal(shown('zeta', 'a'.repeat(64)), false)
   assert.equal(shown('', 'f'.repeat(64)), false)
+  // A Compose project row: drawn while the filter leaves it any container.
+  assert.equal(shown('', 'project:shop'), true)
+  assert.equal(shown('db', 'project:shop'), true)
+  assert.equal(shown('zeta', 'project:shop'), false)
+  assert.equal(shown('', 'project:gone'), false)
   // Images, volumes and networks.
   assert.equal(shown('', `image:${IMAGE_ID}:latest~2`), true)
   assert.equal(shown('nginx', `image:${IMAGE_ID}:latest`), true)
