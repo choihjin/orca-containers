@@ -98,10 +98,10 @@ In Orca, open **Settings → Plugins**, choose **Add plugin → From a Git URL�
 URL with a version tag and install:
 
 ```text
-https://github.com/choihjin/orca-containers#v0.5.0
+https://github.com/choihjin/orca-containers#v0.5.1
 ```
 
-Or from a terminal: `orca plugin install choihjin/orca-containers@v0.5.0` (on Linux, `orca-ide plugin install …`).
+Or from a terminal: `orca plugin install choihjin/orca-containers@v0.5.1` (on Linux, `orca-ide plugin install …`).
 
 Orca shows what the plugin asks for before it runs anything. Review it, then enable it.
 

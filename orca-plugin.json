@@ -4,7 +4,7 @@
   "execution": "trusted-worker",
   "id": "containers",
   "name": "Containers",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Lists and manages containers, images, volumes and networks on this computer (macOS or Linux) and on Linux or macOS SSH hosts from a sidebar panel: logs in the panel, a shell and image pulls in an Orca terminal.",
   "icon": "assets/icon.png",
   "cover": { "path": "assets/cover.png", "alt": "The Containers icon and name beside two Containers panels, one light and one dark" },
@@ -16,10 +16,6 @@
     { "path": "assets/screenshots/problems-light.png", "alt": "Two panels: an SSH host whose ssh connection failed, and a host whose Docker daemon is stopped", "caption": "Clear messages when ssh or Docker fails", "theme": "light" },
     { "path": "assets/screenshots/problems-dark.png", "alt": "Two panels: an SSH host whose ssh connection failed, and a host whose Docker daemon is stopped", "caption": "Clear messages when ssh or Docker fails", "theme": "dark" }
   ],
-  "author": {
-    "name": "choihjin",
-    "url": "https://github.com/choihjin"
-  },
   "license": "MIT",
   "engines": {
     "orca": ">=1.4.255"

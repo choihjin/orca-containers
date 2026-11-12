@@ -90,10 +90,10 @@ Orca에서 **Settings → Plugins**를 열고 **Add plugin → From a Git URL…
 저장소 주소를 붙여 넣어 설치합니다.
 
 ```text
-https://github.com/choihjin/orca-containers#v0.5.0
+https://github.com/choihjin/orca-containers#v0.5.1
 ```
 
-터미널에서는 `orca plugin install choihjin/orca-containers@v0.5.0`으로도 설치할 수 있습니다(Linux에서는 `orca-ide plugin install …`).
+터미널에서는 `orca plugin install choihjin/orca-containers@v0.5.1`으로도 설치할 수 있습니다(Linux에서는 `orca-ide plugin install …`).
 
 Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. 확인한 뒤 켜세요.
 
