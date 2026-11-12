@@ -8,9 +8,10 @@ import type { ContainerRow, HostId, HostInfo, Problem, Result, Snapshot } from '
 
 type Stubs = { [K in keyof PluginRequests]-?: (input: PluginRequests[K]['input']) => PluginRequests[K]['output'] }
 
-// A missing request name is a type error here, not a silent call into the real worker.
-function scenario(r: Stubs, options: Omit<CheckScenario, 'requests'> = {}): CheckScenario & { requests: Stubs } {
-  return { ...options, requests: r }
+// A missing request name is a type error here, not a silent call into the real worker. Check and the plugin page
+// shots paint with Orca's own UI language, so every scenario pins the panel to English.
+function scenario(r: Stubs, options: Omit<CheckScenario, 'requests' | 'settings'> = {}): CheckScenario & { requests: Stubs } {
+  return { ...options, settings: { language: 'en' }, requests: r }
 }
 
 const LOCAL: HostInfo = { id: 'local', label: 'This Mac', kind: 'local', status: 'ready' }

@@ -2,7 +2,7 @@ import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import type { DockerCommand } from '../docker/commands'
 import type { CommandResult } from '../docker/parse'
-import { DOCKER_CANDIDATES } from '../platform'
+import { DOCKER_CANDIDATES, loginShellFor } from '../platform'
 import type { RunOptions } from '../protocol'
 
 export type LocalExec = (file: string, args: string[], options: { timeoutMs: number; merge?: boolean }) =>
@@ -150,7 +150,7 @@ export function nodeLocalDeps(): LocalDeps {
       merge ? runMerged(file, args, timeoutMs, MAX_BUFFER) : run(file, args, timeoutMs, MAX_BUFFER),
     exists: (path) => existsSync(path),
     async loginShellWhich() {
-      const out = await run('/bin/zsh', ['-lc', 'command -v docker'], WHICH_TIMEOUT_MS, 1024 * 1024)
+      const out = await run(loginShellFor(process.env, existsSync), ['-lc', 'command -v docker'], WHICH_TIMEOUT_MS, 1024 * 1024)
       const path = out.stdout.trim()
       return out.code === 0 && path !== '' ? path : null
     },

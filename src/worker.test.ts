@@ -35,7 +35,7 @@ function remoteOutput(script: string, results: Record<string, { code: number; li
 
 type ExecCall = { file: string; args: string[]; input: string; timeoutMs: number; signal?: AbortSignal }
 
-function setup(results: Record<string, unknown> = {}, cliSetup?: (cli: FakeCli) => void) {
+function setup(results: Record<string, unknown> = {}, cliSetup?: (cli: FakeCli) => void, platform = 'darwin') {
   const counts = { cli: 0, local: 0, sshExec: 0 }
   const runs: { deadline: number; hasSignal: boolean; argv: string[][] }[] = []
   const cli = new FakeCli()
@@ -62,7 +62,7 @@ function setup(results: Record<string, unknown> = {}, cliSetup?: (cli: FakeCli) 
     makeCli: () => { counts.cli++; return cli },
     makeLocal: () => { counts.local++; return local },
     makeSshExec: () => { counts.sshExec++; return exec },
-    platform: 'darwin',
+    platform,
     now: () => 1_000,
     randomHex: () => 'deadbeef',
   }
@@ -432,12 +432,12 @@ test('an SSH Shell checks a kernel it does not know with one empty ssh run, then
   assert.equal(s.cli.calls.filter((c) => c.method === 'createTerminal').length, 2)
 })
 
-test('an SSH Shell on a host the check finds not Linux opens no terminal', async () => {
+test('an SSH Shell on a host the check finds unsupported (not Linux or macOS) opens no terminal', async () => {
   const s = setup({}, sshHost)
   const w = await mountWorker(s.module, { host: s.host })
   s.ssh.answer = async (call) => {
     const nonce = /^N=([0-9a-f]{8})$/m.exec(call.input)?.[1] ?? ''
-    return { code: 0, stdout: `${MARK}READY_${nonce}__ Darwin\n`, stderr: '', timedOut: false }
+    return { code: 0, stdout: `${MARK}READY_${nonce}__ FreeBSD\n`, stderr: '', timedOut: false }
   }
   const r = await w.request('docker.openTerminal', { hostId: 'ssh:GPU1', kind: 'shell', containerId: ID, containerName: 'web' }) as { ok: boolean; problem: { kind: string } }
   assert.equal(r.problem.kind, 'unsupported', JSON.stringify(r))
@@ -516,4 +516,16 @@ test('after deactivate a request answers timeout at once, without listing hosts 
   assert.deepEqual(s.cli.calls, [])
   assert.equal(s.execs.length, 0)
   assert.equal(s.runs.length, 0)
+})
+
+// Orca on Linux: the local host is "This computer", and ssh messages name it the same way.
+test('on Linux the worker lists This computer and its ssh messages say this computer', async () => {
+  const s = setup({}, sshHost, 'linux')
+  const w = await mountWorker(s.module, { host: s.host })
+  const hosts = await w.request('hosts.list', {}) as { ok: boolean; value: { hosts: { id: string; label: string; status: string }[] } }
+  assert.deepEqual(hosts.value.hosts[0], { id: 'local', label: 'This computer', kind: 'local', status: 'ready' })
+  s.ssh.answer = async () => ({ code: 255, stdout: '', stderr: 'ssh: Could not resolve hostname gpu1: Name or service not known', timedOut: false })
+  const r = await w.request('docker.snapshot', { hostId: 'ssh:GPU1' }) as { ok: boolean; problem: { kind: string; message: string } }
+  assert.equal(r.problem.kind, 'ssh-failed')
+  assert.match(r.problem.message, / on this computer\./)
 })

@@ -3,7 +3,7 @@
 ![Containers panels for this Mac and an SSH host](assets/cover.png)
 
 See and manage Docker containers from an [Orca](https://github.com/stablyai/orca) sidebar panel, on
-this Mac and on your Linux SSH hosts. Pick a host and see its containers, images, volumes and networks.
+this Mac and on your Linux or macOS SSH hosts. Pick a host and see its containers, images, volumes and networks.
 Start, stop, restart, read logs, open a shell or delete a container; delete images, volumes and networks;
 and pull images in an Orca terminal.
 
@@ -45,12 +45,19 @@ and pull images in an Orca terminal.
 - **Auto refresh** only while the panel is visible: every 10 s for this Mac, every 60 s for SSH hosts.
   Change both in the plugin's Settings: `refreshLocalSeconds` (3–600) and `refreshRemoteSeconds`
   (15–3600).
+- **Language:** the panel follows Orca's UI language: Korean when Orca is in Korean, English otherwise.
+  The plugin's **Language** setting (`language`) picks one instead: Follow Orca (`auto`, the default), English
+  or 한국어. What Docker and ssh say (a daemon error, why ssh failed) and container statuses ("Up 5 days")
+  stay in English, as they come.
 
 ## Requirements
 
-- Orca 1.4.255 or newer, on macOS
+- Orca 1.4.255 or newer, on macOS or Linux. On Linux the panel calls the local host "This computer" where this
+  README says "this Mac", and the plugin runs Orca's CLI as `orca-ide` (or `ORCA_CLI_COMMAND` when Orca sets it),
+  never a bare `orca`, which on Linux is usually the GNOME screen reader.
 - `docker` installed on this Mac, and on each SSH host you want to use
-- SSH hosts running Linux, added through Orca's own SSH host feature
+- SSH hosts running Linux or macOS, added through Orca's own SSH host feature. On a Mac host, Docker Desktop must
+  be running there (it starts its daemon only in a logged-in session).
 - For each SSH host, a `Host` entry in `~/.ssh/config` on this Mac with exactly the Orca host name, that
   logs in with a key and no prompt (for example a key held by ssh-agent). To check, run
   `ssh -o BatchMode=yes <host name> true` in a terminal on this Mac: it must finish without an error.
@@ -66,20 +73,22 @@ In Orca, open **Settings → Plugins**, choose **Add plugin → From a Git URL�
 URL with a version tag and install:
 
 ```text
-https://github.com/choihjin/orca-containers#v0.2.0
+https://github.com/choihjin/orca-containers#v0.3.0
 ```
 
-Or from a terminal: `orca plugin install choihjin/orca-containers@v0.2.0`.
+Or from a terminal: `orca plugin install choihjin/orca-containers@v0.3.0` (on Linux, `orca-ide plugin install …`).
 
 Orca shows what the plugin asks for before it runs anything. Review it, then enable it.
 
 ## How it works
 
 - **This Mac:** the plugin's worker runs the `docker` command directly.
-- **Finding `docker` on this Mac:** if `docker` is not in `/usr/local/bin`, `/opt/homebrew/bin` or
-  `/usr/bin`, the worker runs `/bin/zsh -lc 'command -v docker'`, which runs your zsh login startup files
-  (`~/.zshenv`, `~/.zprofile`, `~/.zlogin`); a path it finds is reused, and while none is found this
-  repeats on each refresh.
+- **Finding `docker` on this Mac:** if `docker` is not in `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin` or
+  `/snap/bin`, the worker runs `<shell> -lc 'command -v docker'`. The shell is your `$SHELL` when it is sh, bash,
+  zsh, dash or ksh, else `/bin/zsh`, else `/bin/sh`, and that shell's login startup files run (for zsh
+  `~/.zshenv`, `~/.zprofile`, `~/.zlogin`; for bash the first of `~/.bash_profile`, `~/.bash_login`, `~/.profile`; for
+  sh `/etc/profile` and `~/.profile`). A path it finds is
+  reused, and while none is found this repeats on each refresh.
 - **SSH hosts:** listing, actions (deleting included) and the logs in the panel run `ssh <host name>`
   from this Mac, with the Orca host name as the ssh destination, and send a fixed script to `sh` on that
   host. They open no terminal and need only ssh: whether Orca can reach the host or has a workspace there
@@ -114,12 +123,19 @@ terminal and Pull) go through the Orca command-line tool.
   characters. Open in terminal shows them whole.
 - If an SSH host's login shell startup files start tmux or screen automatically, the docker command of
   Shell, Open in terminal or Pull may be typed into that program.
+- Orca on Linux was tested with unit tests only, not on a real Linux desktop.
+- Relative times ("3 minutes ago") are drawn by Orca in Orca's own UI language, whatever the Language setting says.
+- The worker runs `docker` with its own environment: a `DOCKER_HOST` set only in your shell startup files
+  (rootless Docker, colima) is not seen, so the panel may say Docker is not running while a terminal works.
+- macOS SSH hosts were tested with a simulated Mac shell, not on a real remote Mac. On a Mac host, docker is
+  looked up in PATH, then in /usr/local/bin, /opt/homebrew/bin and Docker Desktop's app bundle; a docker
+  installed elsewhere is not found. A Mac host has no `timeout` command, so one stuck docker command waits for
+  the 60 s ssh limit instead of 20 s.
 
 ## Not in v1
 
-Planned for later, each to be verified before work starts: Compose up/down; Orca on Linux or Windows;
-macOS SSH hosts; Orca older than 1.4.255; a Korean UI; detecting SSH hosts whose login shell starts tmux or
-screen automatically.
+Planned for later, each to be verified before work starts: Compose up/down; Orca on Windows;
+Orca older than 1.4.255; detecting SSH hosts whose login shell starts tmux or screen automatically.
 
 ## Development
 
@@ -129,6 +145,8 @@ pnpm test        # orca plugin test .
 pnpm typecheck   # writes Orca's typings, then tsc
 orca plugin validate .
 ```
+
+On Linux, use `orca-ide` where these commands say `orca`.
 
 The icon, cover and screenshots are HTML pages in `assets/src`. `assets/src/render.sh shots` captures the
 panel from the check scenarios (Orca's window must be hidden or minimized), and `assets/src/render.sh images`

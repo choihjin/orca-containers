@@ -132,19 +132,20 @@ export function nodeSshExec(options: SshExecOptions = {}): SshExec {
   })
 }
 
-export type SshRunnerDeps = { exec: SshExec; storage: KeyValueStore; now: () => number; randomHex: () => string; sshPath?: string }
+// localName: how messages name the computer the ssh runs from (localNameInText: 'this Mac', or 'this computer' on Linux).
+export type SshRunnerDeps = { exec: SshExec; storage: KeyValueStore; now: () => number; randomHex: () => string; sshPath?: string; localName: string }
 export type SshRunner = { run(env: string, commands: readonly DockerCommand[], options: RunOptions): Promise<Result<CommandResult[]>> }
 
 const fail = (kind: ProblemKind, message: string): Result<never> => ({ ok: false, problem: { kind, message } })
 const unknownResult = () => fail('unknown-result', 'sent; result unknown')
 
 // ssh's own failure (exit 255 before the script said READY), told apart by its stderr.
-function sshFailure(env: string, stderr: string): Result<never> {
+function sshFailure(env: string, stderr: string, here: string): Result<never> {
   if (/Could not resolve hostname/.test(stderr)) {
-    return fail('ssh-failed', `No ssh host named "${env}" on this Mac. Add a "Host ${env}" entry with key login to ~/.ssh/config.`)
+    return fail('ssh-failed', `No ssh host named "${env}" on ${here}. Add a "Host ${env}" entry with key login to ~/.ssh/config.`)
   }
   if (/Permission denied|Host key verification failed|No more authentication methods|passphrase/i.test(stderr)) {
-    return fail('ssh-failed', `ssh could not log in to "${env}" without a prompt. Run \`ssh ${env}\` once in a terminal on this Mac and use a key that needs no typing (ssh-agent).`)
+    return fail('ssh-failed', `ssh could not log in to "${env}" without a prompt. Run \`ssh ${env}\` once in a terminal on ${here} and use a key that needs no typing (ssh-agent).`)
   }
   const first = stderr.split('\n').map((line) => cleanText(line, Infinity).trim()).find((line) => line !== '')
   if (first === undefined) return fail('ssh-failed', `ssh to "${env}" failed with exit code 255.`)
@@ -153,6 +154,7 @@ function sshFailure(env: string, stderr: string): Result<never> {
 
 export function createSshRunner(deps: SshRunnerDeps): SshRunner {
   const sshPath = deps.sshPath ?? SSH_PATH
+  const here = deps.localName
   return {
     // Runs on one host may overlap: each run is its own ssh process with its own nonce.
     async run(env, commands, options) {
@@ -173,7 +175,7 @@ export function createSshRunner(deps: SshRunnerDeps): SshRunner {
         timeoutMs: Math.min(SSH_RUN_TIMEOUT_MS, remaining),
         ...(options.signal ? { signal: options.signal } : {}),
       })
-      if (out.spawnError !== undefined) return fail('ssh-failed', `The ssh command could not start on this Mac: ${out.spawnError}.`)
+      if (out.spawnError !== undefined) return fail('ssh-failed', `The ssh command could not start on ${here}: ${out.spawnError}.`)
 
       const lines = out.stdout.split('\n')
       const ready = readyInfo(lines, nonce)
@@ -195,7 +197,7 @@ export function createSshRunner(deps: SshRunnerDeps): SshRunner {
       if (run.complete) return { ok: true, value: run.results }
       if (maybeSent) return unknownResult()
       if (stopped) return fail('timeout', `The ssh session to "${env}" did not finish in time`)
-      if (!ready && out.code === 255) return sshFailure(env, out.stderr)
+      if (!ready && out.code === 255) return sshFailure(env, out.stderr, here)
       return fail('failed', `The ssh session to "${env}" ended before docker finished.`)
     },
   }

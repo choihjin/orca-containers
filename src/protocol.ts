@@ -2,8 +2,8 @@ export const REQUEST_TIMEOUT_MS = 110_000
 export const WORK_BUDGET_MS = 100_000
 export type RunOptions = { deadline: number; signal?: AbortSignal } // worker 안에서 한 요청의 예산
 export type HostId = 'local' | `ssh:${string}`
-// unsupported: this Mac's platform, or the SSH host's stored kernel, is not supported. Orca's workspace listing does
-// not decide a status: an SSH host is ready unless unsupported, and ssh tells the rest.
+// unsupported: the local platform is not macOS or Linux, or the SSH host's stored kernel is not Linux or macOS.
+// Orca's workspace listing does not decide a status: an SSH host is ready unless unsupported, and ssh tells the rest.
 export type HostStatus = 'ready' | 'unsupported'
 export type HostInfo = { id: HostId; label: string; kind: 'local' | 'ssh'; status: HostStatus }
 // ssh-failed: ssh itself failed (unknown host, no login without a prompt, could not start). `message` says what failed

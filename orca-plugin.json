@@ -4,8 +4,8 @@
   "execution": "trusted-worker",
   "id": "containers",
   "name": "Containers",
-  "version": "0.2.0",
-  "description": "Lists and manages containers, images, volumes and networks on this Mac and on Linux SSH hosts from a sidebar panel: logs in the panel, a shell and image pulls in an Orca terminal.",
+  "version": "0.3.0",
+  "description": "Lists and manages containers, images, volumes and networks on this computer (macOS or Linux) and on Linux or macOS SSH hosts from a sidebar panel: logs in the panel, a shell and image pulls in an Orca terminal.",
   "icon": "assets/icon.png",
   "cover": { "path": "assets/cover.png", "alt": "The Containers icon and name beside two Containers panels, one light and one dark" },
   "screenshots": [
@@ -38,7 +38,8 @@
     ],
     "settings": [
       { "key": "refreshLocalSeconds", "title": "Local refresh (seconds)", "type": "integer", "default": 10, "minimum": 3, "maximum": 600 },
-      { "key": "refreshRemoteSeconds", "title": "SSH refresh (seconds)", "type": "integer", "default": 60, "minimum": 15, "maximum": 3600 }
+      { "key": "refreshRemoteSeconds", "title": "SSH refresh (seconds)", "type": "integer", "default": 60, "minimum": 15, "maximum": 3600 },
+      { "key": "language", "title": "Language", "type": "string", "default": "auto", "enum": ["auto", "en", "ko"], "enumLabels": ["Follow Orca", "English", "한국어"] }
     ]
   },
   "capabilities": [

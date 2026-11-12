@@ -5,7 +5,9 @@ import type { LocalRunner } from './local/runner'
 import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
 import { CliError, type CallOptions, type OrcaCli } from './remote/orca-cli'
 import { FakeCli } from './remote/fake-cli'
-import type { DockerCommand } from './docker/commands'
+import { pullArgv, terminalArgv, type DockerCommand } from './docker/commands'
+import { shellCommand } from './platform'
+import { macTerminalArgv } from './remote/script'
 import type { CommandResult } from './docker/parse'
 import { createService, terminalTitle } from './service'
 
@@ -54,6 +56,7 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
   const kernel = opts.kernel === undefined ? 'Linux' : opts.kernel
   if (kernel !== null) stored.set(kernelKey('A'), kernel)
   let storageFails = false
+  let checkKernel: string | null = null
   const storage: KeyValueStore = {
     async get(key) {
       log.order.push(`storage.get ${key}`)
@@ -67,7 +70,11 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
     async run(commands, options) { calls.push('local.run'); log.order.push('local.run'); log.localRuns.push({ commands, options }); return localResults },
   }
   const ssh: SshRunner = {
-    async run(env, commands, options) { calls.push('ssh.run'); log.order.push('ssh.run'); log.sshRuns.push({ env, commands, options }); return sshResult },
+    async run(env, commands, options) {
+      calls.push('ssh.run'); log.order.push('ssh.run'); log.sshRuns.push({ env, commands, options })
+      if (commands.length === 0 && checkKernel !== null) stored.set(kernelKey(env), checkKernel)
+      return sshResult
+    },
   }
   const cli = {
     async createTerminal(o: { environment: string; worktreePath: string; title: string; command: string; focus?: boolean }) {
@@ -93,6 +100,7 @@ function setup(opts: { status?: HostStatus; anchor?: Anchor | NoAnchor; kernel?:
     failCreate(e: Error) { createError = e },
     failSwitch(e: Error) { switchError = e },
     failStorageRead() { storageFails = true },
+    setCheckKernel(k: string) { checkKernel = k },
   }
 }
 
@@ -364,12 +372,12 @@ describe('service', () => {
     const r = await t.service.openTerminal('ssh:A', 'shell', ID, 'web', FOCUS, OPTIONS)
     assert.deepEqual(r, { ok: true, value: { opened: true, workspace: 'main' } })
     assert.deepEqual(t.log.sshRuns, [{ env: 'A', commands: [], options: OPTIONS }])
-    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(t.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
   })
 
   test('a failing kernel check answers its own problem and opens no terminal', async () => {
     const problems = [
-      { kind: 'unsupported' as const, message: 'Remote kernel Darwin is not supported' },
+      { kind: 'unsupported' as const, message: 'Remote kernel FreeBSD is not supported' },
       { kind: 'ssh-failed' as const, message: 'No ssh host named "A" on this Mac.' },
       { kind: 'timeout' as const, message: 'The ssh session to "A" did not finish in time' },
     ]
@@ -392,8 +400,48 @@ describe('service', () => {
     assert.equal(t.log.order.filter((step) => step.startsWith('storage.get')).length, 1)
   })
 
-  test('a stored kernel other than Linux answers unsupported at once: no ssh run, no terminal', async () => {
+  test('a stored Linux kernel types the plain docker command', async () => {
+    const t = setup({ kernel: 'Linux' })
+    assert.equal((await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, true)
+    assert.equal(t.log.created[0]?.command, shellCommand(terminalArgv('shell', ID)))
+  })
+
+  // A Mac host's terminal shell may not be a login shell, so /usr/local/bin may be missing from its PATH: the command
+  // looks docker up the way the ssh script does.
+  test('a stored Darwin kernel opens the SSH terminal without an ssh run, with the macOS docker lookup', async () => {
     const t = setup({ kernel: 'Darwin' })
+    assert.equal((await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, true)
+    assert.equal((await t.service.pullTerminal('ssh:A', 'nginx:1.27', null, OPTIONS)).ok, true)
+    assert.deepEqual(t.log.sshRuns, [])
+    assert.deepEqual(t.log.created.map((c) => c.command), [
+      shellCommand(macTerminalArgv(terminalArgv('shell', ID))),
+      shellCommand(macTerminalArgv(pullArgv('nginx:1.27'))),
+    ])
+  })
+
+  test('a kernel check that finds Darwin also types the macOS docker lookup', async () => {
+    const t = setup({ kernel: null })
+    t.setCheckKernel('Darwin')
+    assert.equal((await t.service.openTerminal('ssh:A', 'logs', ID, 'web', null, OPTIONS)).ok, true)
+    assert.equal(t.log.created[0]?.command, shellCommand(macTerminalArgv(terminalArgv('logs', ID))))
+  })
+
+  // The lookup is plain POSIX and still prefers docker on PATH, so a host whose kernel cannot be read back gets it too.
+  test('a kernel check whose result cannot be read back types the macOS docker lookup', async () => {
+    const t = setup({ kernel: null })
+    t.failStorageRead()
+    assert.equal((await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS)).ok, true)
+    assert.equal(t.log.created[0]?.command, shellCommand(macTerminalArgv(terminalArgv('shell', ID))))
+  })
+
+  test('a local terminal on this Mac keeps the plain docker command', async () => {
+    const t = setup({ kernel: 'Darwin' })
+    assert.equal((await t.service.openTerminal('local', 'shell', ID, 'web', FOCUS, OPTIONS)).ok, true)
+    assert.equal(t.log.localTerminals[0]?.command, shellCommand(terminalArgv('shell', ID)))
+  })
+
+  test('a stored unsupported kernel answers unsupported at once: no ssh run, no terminal', async () => {
+    const t = setup({ kernel: 'FreeBSD' })
     assert.deepEqual(await t.service.openTerminal('ssh:A', 'shell', ID, 'web', null, OPTIONS),
       { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } })
     assert.deepEqual(t.log.sshRuns, [])
@@ -645,14 +693,14 @@ describe('service: pull an image in a terminal', () => {
     assert.equal(t.log.localTerminals[0]!.command, `docker pull name@${DIGEST}`)
   })
 
-  test('a pull follows the Shell rules: Linux check, anchor, host status', async () => {
+  test('a pull follows the Shell rules: kernel check, anchor, host status', async () => {
     const unknownKernel = setup({ kernel: null, anchor: { path: '/home/me/main' } })
     assert.equal((await unknownKernel.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS)).ok, true)
     assert.deepEqual(unknownKernel.log.sshRuns, [{ env: 'A', commands: [], options: OPTIONS }])
-    assert.deepEqual(unknownKernel.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', 'createTerminal', 'remember', 'switchTo'])
+    assert.deepEqual(unknownKernel.log.order, ['anchor', `storage.get ${kernelKey('A')}`, 'ssh.run', `storage.get ${kernelKey('A')}`, 'createTerminal', 'remember', 'switchTo'])
     const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
-    const darwin = setup({ kernel: 'Darwin' })
-    assert.deepEqual(await darwin.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), unsupported)
+    const other = setup({ kernel: 'FreeBSD' })
+    assert.deepEqual(await other.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), unsupported)
     const down = setup({ status: 'unsupported' })
     assert.deepEqual(await down.service.pullTerminal('local', 'nginx', FOCUS, OPTIONS), unsupported)
     assert.deepEqual(await down.service.pullTerminal('ssh:A', 'nginx', null, OPTIONS), unsupported)
@@ -664,7 +712,7 @@ describe('service: pull an image in a terminal', () => {
         { ok: false, problem: { kind: 'no-workspace', message: 'This host has no workspace.' } })
       assert.deepEqual(t.calls, [])
     }
-    for (const t of [darwin, down]) {
+    for (const t of [other, down]) {
       assert.deepEqual([...t.log.created, ...t.log.localTerminals, ...t.log.sshRuns], [])
     }
     const cliDown = setup()
@@ -784,10 +832,10 @@ describe('service on SSH hosts with Orca listing trouble', () => {
     assert.deepEqual(t.runs, [])
   })
 
-  test('a known non-Linux kernel answers unsupported for everything, with no ssh run and no terminal', async () => {
+  test('a known unsupported kernel answers unsupported for everything, with no ssh run and no terminal', async () => {
     const t = listingSetup()
-    t.data.set(kernelKey('GPU2'), 'Darwin')
-    t.data.set(kernelKey('cloud-gpu'), 'Darwin')
+    t.data.set(kernelKey('GPU2'), 'FreeBSD')
+    t.data.set(kernelKey('cloud-gpu'), 'FreeBSD')
     const unsupported = { ok: false, problem: { kind: 'unsupported', message: 'This host is not supported.' } }
     for (const hostId of ['ssh:GPU2', 'ssh:cloud-gpu'] as const) {
       assert.deepEqual(await t.service.snapshot(hostId, OPTIONS), unsupported, hostId)

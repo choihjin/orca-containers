@@ -23,7 +23,7 @@ test('allowed actions follow the container state', () => {
 // "no workspace" labels: Orca's workspace listing no longer decides).
 test('host options mark and disable only unsupported hosts', () => {
   const options = hostOptions([
-    host('local', 'Mac', 'ready'), host('ssh:GPU1', 'GPU1', 'ready'), host('ssh:cloud-gpu', 'cloud-gpu', 'ready'),
+    host('local', 'This Mac', 'ready'), host('ssh:GPU1', 'GPU1', 'ready'), host('ssh:cloud-gpu', 'cloud-gpu', 'ready'),
     host('ssh:old', 'old', 'unsupported'),
   ])
   assert.deepEqual(options, [
@@ -32,7 +32,12 @@ test('host options mark and disable only unsupported hosts', () => {
     { value: 'ssh:cloud-gpu', label: 'cloud-gpu (SSH)' },
     { value: 'ssh:old', label: 'old (SSH, unsupported)', disabled: true },
   ])
-  assert.deepEqual(hostOptions([host('local', 'Mac', 'unsupported')]), [{ value: 'local', label: 'This Mac (unsupported)', disabled: true }])
+  assert.deepEqual(hostOptions([host('local', 'Mac', 'unsupported')]), [{ value: 'local', label: 'Mac (unsupported)', disabled: true }])
+  // The local host's own label: "This Mac" on macOS, "This computer" on Linux.
+  assert.deepEqual(hostOptions([host('local', 'This computer', 'ready')]), [{ value: 'local', label: 'This computer' }])
+  // In Korean the local host's own names read 이 Mac / 이 컴퓨터; SSH host names stay as they are.
+  assert.deepEqual(hostOptions([host('local', 'This Mac', 'ready'), host('ssh:GPU1', 'GPU1', 'ready')], 'ko').map((o) => o.label), ['이 Mac', 'GPU1 (SSH)'])
+  assert.deepEqual(hostOptions([host('local', 'This computer', 'unsupported')], 'ko').map((o) => o.label), ['이 컴퓨터 (지원 안 함)'])
   assert.ok(options.slice(0, 3).every((o) => !('disabled' in o)), JSON.stringify(options))
 })
 
@@ -126,7 +131,7 @@ test('log text strips ANSI escapes', () => {
 
 test('problem copy', () => {
   const expected: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed'>, [string, string]> = {
-    unsupported: ['Not supported here', 'This version supports Orca on macOS with Linux SSH hosts.'],
+    unsupported: ['Not supported here', 'This version supports Orca on macOS or Linux, with Linux or macOS SSH hosts.'],
     unreachable: ['Host unreachable', 'Orca could not reach this host. Check its SSH connection in Orca.'],
     'no-workspace': ['No workspace on this host', 'Open a workspace on this host in Orca first.'],
     'docker-missing': ['Docker CLI not found', 'Install the docker command on this host.'],
@@ -426,4 +431,83 @@ test('shownKey: whether the trees draw an item for this filter', () => {
   assert.equal(shown('ml_', `network:${NET_ID}`), true)
   assert.equal(shown('pg', `network:${NET_ID}`), false)
   assert.equal(shown('', 'volume:gone'), false)
+})
+
+// Korean: the same functions with `ko`; what Docker, ssh and the worker say stays as it came.
+test('problem copy in Korean: fixed titles and descriptions, the message as it came for invalid, failed and ssh-failed', () => {
+  const expected: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed'>, [string, string]> = {
+    unsupported: ['여기서는 지원하지 않습니다', '이 버전은 macOS·Linux의 Orca와 Linux·macOS SSH 호스트를 지원합니다.'],
+    unreachable: ['호스트에 연결할 수 없습니다', 'Orca가 이 호스트에 연결하지 못했습니다. Orca에서 이 호스트의 SSH 연결을 확인하세요.'],
+    'no-workspace': ['이 호스트에 워크스페이스가 없습니다', '먼저 Orca에서 이 호스트의 워크스페이스를 여세요.'],
+    'docker-missing': ['Docker CLI를 찾을 수 없습니다', '이 호스트에 docker 명령을 설치하세요.'],
+    'daemon-down': ['Docker가 실행 중이 아닙니다', '이 호스트에서 Docker 데몬을 시작하세요.'],
+    'permission-denied': ['권한이 없습니다', '지금 계정으로는 이 호스트의 Docker 소켓을 쓸 수 없습니다.'],
+    truncated: ['목록이 너무 깁니다', '출력이 너무 커서 보여 줄 수 없습니다.'],
+    timeout: ['시간이 초과되었습니다', 'Docker가 제시간에 응답하지 않았습니다.'],
+    'unknown-result': ['결과를 알 수 없습니다', '명령은 보냈지만 결과가 돌아오지 않았습니다. 새로고침해서 확인하세요.'],
+  }
+  for (const [kind, [title, description]] of Object.entries(expected)) {
+    assert.deepEqual(problemCopy({ kind: kind as ProblemKind, message: 'ignored' }, 'ko'), { title, description })
+  }
+  assert.deepEqual(problemCopy({ kind: 'invalid', message: 'bad id' }, 'ko'), { title: '잘못된 요청입니다', description: 'bad id' })
+  assert.deepEqual(problemCopy({ kind: 'failed', message: 'boom' }, 'ko'), { title: '명령이 실패했습니다', description: 'boom' })
+  const sshMessage = 'No ssh host named "GPU1" on this Mac. Add a "Host GPU1" entry with key login to ~/.ssh/config.'
+  assert.deepEqual(problemCopy({ kind: 'ssh-failed', message: sshMessage }, 'ko'), { title: 'SSH 연결에 실패했습니다', description: sshMessage })
+  // English stays the default, and `en` asks for it.
+  assert.deepEqual(problemCopy({ kind: 'timeout', message: '' }, 'en'), { title: 'Timed out', description: 'Docker did not answer in time.' })
+})
+
+test('host options in Korean: the local host in Korean, SSH host names as they are, SSH in English, unsupported translated', () => {
+  const options = hostOptions([
+    host('local', 'This Mac', 'ready'), host('ssh:GPU1', 'GPU1', 'ready'), host('ssh:old', 'old', 'unsupported'),
+  ], 'ko')
+  assert.deepEqual(options, [
+    { value: 'local', label: '이 Mac' },
+    { value: 'ssh:GPU1', label: 'GPU1 (SSH)' },
+    { value: 'ssh:old', label: 'old (SSH, 지원 안 함)', disabled: true },
+  ])
+  assert.deepEqual(hostOptions([host('local', 'Mac', 'unsupported')], 'ko'), [{ value: 'local', label: 'Mac (지원 안 함)', disabled: true }])
+  assert.deepEqual(hostOptions([host('ssh:old', 'old', 'unsupported')], 'en'), [{ value: 'ssh:old', label: 'old (SSH, unsupported)', disabled: true }])
+})
+
+test('tree descriptions in Korean: counts translated, Docker values as they came', () => {
+  const tree = containerTree(FIXTURE_CONTAINERS, '', 'ko')
+  assert.deepEqual(tree.map((t) => [t.key, t.description]), [
+    ['project:blog', 'Compose · 0/1 실행 중'], ['project:shop', 'Compose · 1/2 실행 중'], ['e'.repeat(64), 'img · Exited (0) 1 hour ago'], ['c'.repeat(64), 'img · Up 2 hours'],
+  ])
+  assert.deepEqual(tree[1]!.children?.map((t) => t.description), ['Exited (0) 1 hour ago', 'Up 2 hours'])
+  // The keys and labels do not depend on the language.
+  const strip = (items: readonly TreeItem[]): unknown => items.map((t) => [t.key, t.label, strip(t.children ?? [])])
+  assert.deepEqual(strip(tree), strip(containerTree(FIXTURE_CONTAINERS, '')))
+  const images = imageTree(FIXTURE_IMAGES, '', 'ko')
+  assert.deepEqual(images.map((t) => t.description), ['태그 2개', '태그 2개', '태그 1개'])
+  assert.deepEqual(images[1]!.children?.map((t) => t.description), ['10MB · 2 days ago', '10MB · 2 days ago'])
+  assert.deepEqual(strip(images), strip(imageTree(FIXTURE_IMAGES, '')))
+  assert.deepEqual(imageTree(FIXTURE_IMAGES, '', 'en').map((t) => t.description), ['2 tags', '2 tags', '1 tag'])
+})
+
+test('details cards in Korean: field names and delete copy translated, values as they came', () => {
+  const full = containerDetails(c('0123456789abcdef', 'x', 'exited', { ports: '80/tcp', project: 'shop', service: 'web', status: 'Exited (1) 2 hours ago' }), 'ko')
+  assert.deepEqual(full, [
+    { label: '이미지', value: 'img' }, { label: '상태', value: 'Exited (1) 2 hours ago', tone: 'danger' }, { label: '포트', value: '80/tcp', code: true },
+    { label: 'Compose', value: 'shop / web' }, { label: 'ID', value: '0123456789ab', code: true },
+  ])
+  const tag = resourceDetails(RESOURCES, `image:${IMAGE_ID}:latest`, 'ko')
+  assert.deepEqual(tag, {
+    kind: 'image', key: `image:${IMAGE_ID}:latest`, title: 'nginx:latest',
+    items: [{ label: 'ID', value: '5f1e6a2b0c3d', code: true }, { label: '크기', value: '192MB' }, { label: '생성', value: '2 weeks ago' }],
+    removeRef: 'nginx:latest', removeBlocked: null, pullRef: 'nginx:latest',
+    removeText: '태그를 삭제하고, 이미지에 다른 태그가 없으면 이미지도 삭제합니다. 되돌릴 수 없습니다.',
+  })
+  assert.equal(resourceDetails(RESOURCES, `image:${UNTAGGED_ID}:<none>`, 'ko')?.removeText, '호스트에서 이미지를 삭제합니다. 되돌릴 수 없습니다.')
+  const volume = resourceDetails(RESOURCES, 'volume:pgdata', 'ko')
+  assert.deepEqual([volume?.items, volume?.removeText], [[{ label: '드라이버', value: 'local' }], '호스트에서 볼륨을 데이터와 함께 삭제합니다. 되돌릴 수 없습니다.'])
+  const network = resourceDetails(RESOURCES, `network:${NET_ID}`, 'ko')
+  assert.deepEqual([network?.items.map((i) => i.label), network?.removeText, network?.removeBlocked], [
+    ['드라이버', '범위', 'ID'], '호스트에서 네트워크를 삭제합니다. 되돌릴 수 없습니다.', null,
+  ])
+  assert.equal(resourceDetails(RESOURCES, `network:${'a'.repeat(64)}`, 'ko')?.removeBlocked, 'Docker 기본 네트워크는 삭제할 수 없습니다.')
+  // English stays the default, and `en` asks for it.
+  assert.deepEqual(resourceDetails(RESOURCES, 'volume:pgdata', 'en'), resourceDetails(RESOURCES, 'volume:pgdata'))
+  assert.deepEqual(containerDetails(c('x', 'x', 'running'), 'en').map((i) => i.label), ['Image', 'Status', 'ID'])
 })

@@ -87,31 +87,33 @@ describe('hosts', () => {
     assert.deepEqual(hosts.localHost(), { id: 'local', label: 'This Mac', kind: 'local', status: 'ready' })
     assert.deepEqual(await hosts.anchor('local', null), { path: '/Users/me/orca-docker', workspaceId: 'identity:wt2:local:1', name: 'main' })
     assert.equal(listing.asks, 0)
+    const windows = setup({ platform: 'win32' })
+    assert.deepEqual(windows.hosts.localHost(), { id: 'local', label: 'This computer', kind: 'local', status: 'unsupported' })
+    assert.deepEqual(await windows.hosts.anchor('local', null), { missing: 'no-workspace' })
+    assert.deepEqual(windows.cli.calls, [])
     const linux = setup({ platform: 'linux' })
-    assert.deepEqual(linux.hosts.localHost(), { id: 'local', label: 'This Mac', kind: 'local', status: 'unsupported' })
-    assert.deepEqual(await linux.hosts.anchor('local', null), { missing: 'no-workspace' })
-    assert.deepEqual(linux.cli.calls, [])
+    assert.deepEqual(linux.hosts.localHost(), { id: 'local', label: 'This computer', kind: 'local', status: 'ready' })
   })
 
-  test('local is unsupported off macOS', async () => {
-    const { hosts } = setup({ platform: 'linux' })
+  test('local is unsupported on Windows', async () => {
+    const { hosts } = setup({ platform: 'win32' })
     assert.equal((await hosts.list())[0]?.status, 'unsupported')
   })
 
-  // Ruling M9 (spec 2.1): off macOS nothing is tried, SSH hosts included.
-  test('off macOS the SSH hosts are unsupported too', async () => {
-    const { hosts } = setup({ platform: 'linux' })
+  // Ruling M9 (spec 2.1): on Windows nothing is tried, SSH hosts included.
+  test('on Windows the SSH hosts are unsupported too', async () => {
+    const { hosts } = setup({ platform: 'win32' })
     assert.deepEqual((await hosts.list()).map((h) => [h.id, h.status]), [
       ['local', 'unsupported'], ['ssh:GPU1', 'unsupported'], ['ssh:GPU2', 'unsupported'], ['ssh:cloud-gpu', 'unsupported'],
     ])
   })
 
-  test('a recorded non-Linux kernel makes the host unsupported at once, until refresh', async () => {
+  test('a recorded unsupported kernel makes the host unsupported at once, until refresh', async () => {
     const { hosts, mem, cli } = setup()
     const reads = () => cli.calls.filter((c) => c.method === 'listWorktrees').length
     assert.equal((await hosts.list(true)).find((h) => h.id === 'ssh:GPU1')?.status, 'ready')
     const before = reads()
-    await mem.store.set(kernelKey('GPU1'), 'Darwin')
+    await mem.store.set(kernelKey('GPU1'), 'FreeBSD')
     assert.equal((await hosts.list()).find((h) => h.id === 'ssh:GPU1')?.status, 'unsupported')
     assert.equal(reads(), before)
     assert.equal((await hosts.list(true)).find((h) => h.id === 'ssh:GPU1')?.status, 'ready')
@@ -119,14 +121,16 @@ describe('hosts', () => {
   })
 
   // The kernel decides whatever Orca's listing says: a failed listing (GPU2) or an empty one (cloud-gpu) too.
-  test('a stored Darwin kernel makes an SSH host unsupported, whether its listing failed, was empty or not', async () => {
+  test('a stored FreeBSD kernel makes an SSH host unsupported, whether its listing failed, was empty or not', async () => {
     const { hosts, mem } = setup()
-    for (const env of ['GPU1', 'GPU2', 'cloud-gpu']) await mem.store.set(kernelKey(env), 'Darwin')
+    for (const env of ['GPU1', 'GPU2', 'cloud-gpu']) await mem.store.set(kernelKey(env), 'FreeBSD')
     assert.deepEqual((await hosts.list()).map((h) => [h.id, h.status]), [
       ['local', 'ready'], ['ssh:GPU1', 'unsupported'], ['ssh:GPU2', 'unsupported'], ['ssh:cloud-gpu', 'unsupported'],
     ])
     await mem.store.set(kernelKey('GPU2'), 'Linux')
     assert.equal((await hosts.list()).find((h) => h.id === 'ssh:GPU2')?.status, 'ready')
+    await mem.store.set(kernelKey('GPU1'), 'Darwin') // a Mac host
+    assert.equal((await hosts.list()).find((h) => h.id === 'ssh:GPU1')?.status, 'ready')
   })
 
   test('prefers a local terminal id over a unique name match', async () => {
@@ -396,7 +400,7 @@ describe('hosts', () => {
   })
 
   test('never returns a non-ready host, including local by terminal id', async () => {
-    const { hosts, cli } = setup({ platform: 'linux' })
+    const { hosts, cli } = setup({ platform: 'win32' })
     cli.localTerminals = [{ handle: 'term_x', worktreePath: '/p' }]
     assert.equal(await hosts.matchFocus(focus('zzz', '', ['term_x'])), null)
     assert.equal(await hosts.matchFocus(focus('other')), null)

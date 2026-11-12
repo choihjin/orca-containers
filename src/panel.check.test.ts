@@ -58,3 +58,20 @@ test('each check scenario draws the screen it is named for', async () => {
     view = undefined
   }
 })
+
+// `orca plugin check` and the plugin page shots paint with Orca's own UI language, so every scenario pins English.
+test('every check scenario seeds the English language setting', () => {
+  for (const [name, scenario] of Object.entries(scenarios)) assert.deepEqual(scenario.settings, { language: 'en' }, name)
+})
+
+test('every check scenario stays English under a Korean Orca', async () => {
+  const hangul = /[가-힣]/
+  for (const [name, scenario] of Object.entries(scenarios)) {
+    view = await mount(panel, { host: mockHost(scenario), persisted: scenario.persisted, locale: 'ko-KR' })
+    assert.equal(view.find({ type: 'Select' })?.label, 'Host', name)
+    assert.equal(hangul.test(JSON.stringify(view.tree())), false, `${name}: ${view.summary().join(' | ')}`)
+    assert.deepEqual(view.errors, [], name)
+    await view.unmount()
+    view = undefined
+  }
+})

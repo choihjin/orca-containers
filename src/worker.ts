@@ -4,7 +4,7 @@ import type { PluginRequests } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { createHosts, type LocalWorkspace } from './hosts'
 import { createLocalRunner, nodeLocalDeps, type LocalRunner } from './local/runner'
-import { resolveOrcaCliPath } from './platform'
+import { localNameInText, resolveOrcaCliPath } from './platform'
 import {
   WORK_BUDGET_MS, type ContainerAction, type FocusContext, type HostId, type Problem, type ResourceKind, type RunOptions, type TerminalKind,
 } from './protocol'
@@ -76,7 +76,7 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
       const local = deps.makeLocal()
       const storage = orca.storage as unknown as KeyValueStore
       const hosts = createHosts({ cli, listLocalWorkspaces, platform: deps.platform, storage, now: deps.now, log: (m) => orca.log(m) })
-      const ssh = createSshRunner({ exec: deps.makeSshExec(), storage, now: deps.now, randomHex: deps.randomHex })
+      const ssh = createSshRunner({ exec: deps.makeSshExec(), storage, now: deps.now, randomHex: deps.randomHex, localName: localNameInText(deps.platform) })
       const service = createService({
         hosts, local, ssh, cli, storage, now: deps.now, log: (m) => orca.log(m),
         openLocalTerminal: async (o) => (await orca.host.call('terminal.create', { workspaceId: o.workspaceId, title: o.title, command: o.command })).terminalId,
@@ -197,7 +197,7 @@ export function createWorkerModule(deps: WorkerDeps): { default: (orca: OrcaWork
 }
 
 const real = createWorkerModule({
-  makeCli: () => createOrcaCli(resolveOrcaCliPath(process.env, existsSync), nodeExec()),
+  makeCli: () => createOrcaCli(resolveOrcaCliPath(process.env, existsSync, process.platform), nodeExec()),
   makeLocal: () => createLocalRunner(nodeLocalDeps()),
   makeSshExec: () => nodeSshExec(),
   platform: process.platform,

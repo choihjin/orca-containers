@@ -1,6 +1,7 @@
 import type { IconName, KeyValueItem, TreeItem } from 'orca'
+import { messages, type Lang } from './i18n'
 import type {
-  ContainerRow, ContainerState, HostId, HostInfo, ImageRow, NetworkRow, Problem, ProblemKind, ResourceKind, Snapshot, VolumeRow,
+  ContainerRow, ContainerState, HostId, HostInfo, ImageRow, NetworkRow, Problem, ResourceKind, Snapshot, VolumeRow,
 } from './protocol'
 
 export type Allowed = { start: boolean; stop: boolean; restart: boolean; logs: boolean; shell: boolean; remove: boolean }
@@ -19,12 +20,13 @@ export function allowedActions(state: ContainerState): Allowed {
 }
 
 // Only an unsupported host is marked, and it cannot be picked.
-export function hostOptions(hosts: readonly HostInfo[]): { value: string; label: string; disabled?: boolean }[] {
+export function hostOptions(hosts: readonly HostInfo[], lang: Lang = 'en'): { value: string; label: string; disabled?: boolean }[] {
+  const m = messages[lang]
   return hosts.map((h) => {
     const ready = h.status === 'ready'
-    const base = h.kind === 'local' ? 'This Mac' : h.label
-    const parts = h.kind === 'local' ? [] : ['SSH']
-    if (!ready) parts.push('unsupported')
+    const base = h.kind === 'local' && Object.hasOwn(m.localNames, h.label) ? m.localNames[h.label as keyof typeof m.localNames] : h.label
+    const parts = h.kind === 'local' ? [] : [m.ssh]
+    if (!ready) parts.push(m.unsupported)
     const label = parts.length > 0 ? `${base} (${parts.join(', ')})` : base
     return ready ? { value: h.id, label } : { value: h.id, label, disabled: true }
   })
@@ -87,23 +89,12 @@ export function dueForRefresh(now: number, lastAt: number | null, visible: boole
   return lastAt === null || now - lastAt >= intervalMs
 }
 
-const COPY: Record<Exclude<ProblemKind, 'invalid' | 'failed' | 'ssh-failed'>, { title: string; description: string }> = {
-  unsupported: { title: 'Not supported here', description: 'This version supports Orca on macOS with Linux SSH hosts.' },
-  unreachable: { title: 'Host unreachable', description: 'Orca could not reach this host. Check its SSH connection in Orca.' },
-  'no-workspace': { title: 'No workspace on this host', description: 'Open a workspace on this host in Orca first.' },
-  'docker-missing': { title: 'Docker CLI not found', description: 'Install the docker command on this host.' },
-  'daemon-down': { title: 'Docker is not running', description: 'Start the Docker daemon on this host.' },
-  'permission-denied': { title: 'Permission denied', description: 'Your account cannot use the Docker socket on this host.' },
-  truncated: { title: 'List too long', description: 'The output was too large to show.' },
-  timeout: { title: 'Timed out', description: 'Docker did not answer in time.' },
-  'unknown-result': { title: 'Result unknown', description: 'The command was sent, but its result did not come back. Refresh to check.' },
-}
-
-export function problemCopy(problem: Problem): { title: string; description: string } {
-  if (problem.kind === 'invalid') return { title: 'Invalid request', description: problem.message }
-  if (problem.kind === 'failed') return { title: 'Command failed', description: problem.message }
-  if (problem.kind === 'ssh-failed') return { title: 'SSH connection failed', description: problem.message }
-  return { ...COPY[problem.kind] }
+// The message of an invalid, failed or ssh-failed problem is what the daemon, ssh or the worker said, in English.
+export function problemCopy(problem: Problem, lang: Lang = 'en'): { title: string; description: string } {
+  const copy = messages[lang].problems
+  const { kind } = problem
+  if (kind === 'invalid' || kind === 'failed' || kind === 'ssh-failed') return { title: copy[kind].title, description: problem.message }
+  return { ...copy[kind] }
 }
 
 export function rejectionProblem(error: unknown): Problem {
@@ -168,7 +159,7 @@ function groupedItem(r: ContainerRow, taken: ReadonlyMap<string, number>): TreeI
   return { key: r.id, label, description: r.status, icon: stateIcon(r.state) }
 }
 
-export function containerTree(rows: readonly ContainerRow[], filter: string): TreeItem[] {
+export function containerTree(rows: readonly ContainerRow[], filter: string, lang: Lang = 'en'): TreeItem[] {
   const groups = new Map<string, ContainerRow[]>()
   const singles: ContainerRow[] = []
   for (const r of rows) {
@@ -184,7 +175,7 @@ export function containerTree(rows: readonly ContainerRow[], filter: string): Tr
     const counts = labelCounts(members) // whole group, so a label does not change with the filter
     const running = members.filter((r) => r.state === 'running').length
     out.push({
-      key: `project:${name}`, label: name, description: `compose · ${running}/${members.length} running`, icon: 'layers',
+      key: `project:${name}`, label: name, description: messages[lang].composeRunning(running, members.length), icon: 'layers',
       children: [...shown].sort((a, b) => byName(a.name, b.name)).map((r) => groupedItem(r, counts)),
     })
   }
@@ -198,7 +189,7 @@ const imageKey = (row: ImageRow) => `image:${row.id}:${row.tag}`
 const volumeKey = (row: VolumeRow) => `volume:${row.name}`
 const networkKey = (row: NetworkRow) => `network:${row.id}`
 
-export function imageTree(rows: readonly ImageRow[], filter: string): TreeItem[] {
+export function imageTree(rows: readonly ImageRow[], filter: string, lang: Lang = 'en'): TreeItem[] {
   const keyed = withUniqueKeys(rows, imageKey)
   const groups = new Map<string, typeof keyed>()
   for (const k of keyed) {
@@ -212,7 +203,7 @@ export function imageTree(rows: readonly ImageRow[], filter: string): TreeItem[]
     const shown = matchesFilter(filter, name) ? members : members.filter((m) => matchesFilter(filter, m.row.tag, m.row.id))
     if (shown.length === 0) continue
     out.push({
-      key: `repo:${name}`, label: name, description: `${members.length} ${members.length === 1 ? 'tag' : 'tags'}`, icon: 'layers',
+      key: `repo:${name}`, label: name, description: messages[lang].tags(members.length), icon: 'layers',
       children: shown.map((m) => ({ key: m.key, label: m.row.tag, description: `${m.row.size} · ${m.row.createdSince}`, icon: 'package' as const })),
     })
   }
@@ -269,35 +260,38 @@ const NONE = '<none>'
 // Docker creates these itself and refuses to remove them.
 const BUILT_IN_NETWORKS: readonly string[] = ['bridge', 'host', 'none']
 const shortId = (id: string) => id.replace(/^sha256:/, '').slice(0, 12)
-const removedFromHost = (subject: string) => `${subject} removed from the host. This cannot be undone.`
 
 function rowAt<T>(rows: readonly T[], keyOf: (row: T) => string, key: string): T | null {
   return withUniqueKeys(rows, keyOf).find((k) => k.key === key)?.row ?? null
 }
 
-function imageDetails(row: ImageRow, key: string): ResourceDetails {
+function imageDetails(row: ImageRow, key: string, lang: Lang): ResourceDetails {
+  const m = messages[lang]
   const tagged = row.repository !== NONE && row.tag !== NONE
   const ref = `${row.repository}:${row.tag}`
   return {
     kind: 'image', key, title: row.repository === NONE ? shortId(row.id) : ref,
-    items: [{ label: 'ID', value: shortId(row.id), code: true }, { label: 'Size', value: row.size }, { label: 'Created', value: row.createdSince }],
+    items: [
+      { label: m.fields.id, value: shortId(row.id), code: true }, { label: m.fields.size, value: row.size }, { label: m.fields.created, value: row.createdSince },
+    ],
     removeRef: tagged ? ref : row.id, removeBlocked: null, pullRef: tagged ? ref : null,
-    removeText: tagged ? 'The tag is removed, and the image too when no other tag uses it. This cannot be undone.' : removedFromHost('The image is'),
+    removeText: tagged ? m.removeTag : m.removeImage,
   }
 }
 
-export function resourceDetails(lists: Omit<Lists, 'containers'>, key: string): ResourceDetails | null {
+export function resourceDetails(lists: Omit<Lists, 'containers'>, key: string, lang: Lang = 'en'): ResourceDetails | null {
+  const m = messages[lang]
   const kind = resourceKindOf(key)
   if (kind === 'image') {
     const row = rowAt(lists.images, imageKey, key)
-    return row === null ? null : imageDetails(row, key)
+    return row === null ? null : imageDetails(row, key, lang)
   }
   if (kind === 'volume') {
     const row = rowAt(lists.volumes, volumeKey, key)
     if (row === null) return null
     return {
-      kind, key, title: row.name, items: [{ label: 'Driver', value: row.driver }],
-      removeRef: row.name, removeBlocked: null, removeText: removedFromHost('The volume and its data are'), pullRef: null,
+      kind, key, title: row.name, items: [{ label: m.fields.driver, value: row.driver }],
+      removeRef: row.name, removeBlocked: null, removeText: m.removeVolume, pullRef: null,
     }
   }
   if (kind === 'network') {
@@ -305,16 +299,18 @@ export function resourceDetails(lists: Omit<Lists, 'containers'>, key: string): 
     if (row === null) return null
     return {
       kind, key, title: row.name,
-      items: [{ label: 'Driver', value: row.driver }, { label: 'Scope', value: row.scope }, { label: 'ID', value: shortId(row.id), code: true }],
-      removeRef: row.id, removeBlocked: BUILT_IN_NETWORKS.includes(row.name) ? "Docker's built-in networks cannot be deleted." : null,
-      removeText: removedFromHost('The network is'), pullRef: null,
+      items: [
+        { label: m.fields.driver, value: row.driver }, { label: m.fields.scope, value: row.scope }, { label: m.fields.id, value: shortId(row.id), code: true },
+      ],
+      removeRef: row.id, removeBlocked: BUILT_IN_NETWORKS.includes(row.name) ? m.builtInNetwork : null,
+      removeText: m.removeNetwork, pullRef: null,
     }
   }
   return null
 }
 
-function statusItem(row: ContainerRow): KeyValueItem {
-  const item: KeyValueItem = { label: 'Status', value: row.status }
+function statusItem(row: ContainerRow, label: string): KeyValueItem {
+  const item: KeyValueItem = { label, value: row.status }
   if (row.state === 'running') item.tone = 'success'
   else if (row.state === 'paused' || row.state === 'restarting') item.tone = 'warning'
   else if (row.state === 'dead') item.tone = 'danger'
@@ -325,11 +321,12 @@ function statusItem(row: ContainerRow): KeyValueItem {
   return item
 }
 
-export function containerDetails(row: ContainerRow): KeyValueItem[] {
-  const items: KeyValueItem[] = [{ label: 'Image', value: row.image }, statusItem(row)]
-  if (row.ports !== '') items.push({ label: 'Ports', value: row.ports, code: true })
-  if (row.project !== '') items.push({ label: 'Compose', value: `${row.project} / ${row.service}` })
-  items.push({ label: 'ID', value: row.id.slice(0, 12), code: true })
+export function containerDetails(row: ContainerRow, lang: Lang = 'en'): KeyValueItem[] {
+  const { fields } = messages[lang]
+  const items: KeyValueItem[] = [{ label: fields.image, value: row.image }, statusItem(row, fields.status)]
+  if (row.ports !== '') items.push({ label: fields.ports, value: row.ports, code: true })
+  if (row.project !== '') items.push({ label: fields.compose, value: `${row.project} / ${row.service}` })
+  items.push({ label: fields.id, value: row.id.slice(0, 12), code: true })
   return items
 }
 

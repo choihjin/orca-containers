@@ -6,6 +6,7 @@ import { kernelKey, type KeyValueStore, type SshRunner } from './remote/ssh'
 import { actionCommand, InvalidInputError, logsCommand, pullArgv, removeCommand, SNAPSHOT_COMMANDS, terminalArgv, type DockerCommand } from './docker/commands'
 import { buildSnapshot, classifyFailure, cleanLabel, type CommandResult } from './docker/parse'
 import { isSupportedRemoteKernel, shellCommand } from './platform'
+import { macTerminalArgv } from './remote/script'
 
 export type ServiceDeps = {
   hosts: Hosts; local: LocalRunner; ssh: SshRunner; cli: OrcaCli; now: () => number; log?: (message: string) => void
@@ -82,21 +83,25 @@ export function createService(deps: ServiceDeps): Service {
     return env === null ? { ok: true, value: await local.run(commands, options) } : ssh.run(env, commands, options)
   }
 
-  // A terminal opens only on a host known to run Linux. A stored kernel decides at once: Linux goes on, any other is
-  // unsupported. With none stored, or a store that cannot be read, one ssh run with no docker command reads the
-  // kernel (the runner stores it, and answers unsupported off Linux).
-  async function linuxKnown(env: string, options: RunOptions): Promise<Result<null>> {
-    let kernel: unknown
-    try {
-      kernel = await deps.storage.get(kernelKey(env))
-    } catch {
-      kernel = undefined
+  // A terminal opens only on a host known to run a supported kernel (Linux or macOS). A stored kernel decides at once.
+  // With none stored, or a store that cannot be read, one ssh run with no docker command reads the kernel (the runner
+  // stores it, and answers unsupported for any other kernel).
+  // The answer carries the kernel when it can be read (after a check, from what the runner stored), else null.
+  async function kernelKnown(env: string, options: RunOptions): Promise<Result<{ kernel: string | null }>> {
+    const storedKernel = async (): Promise<string | null> => {
+      try {
+        const kernel = await deps.storage.get(kernelKey(env))
+        return typeof kernel === 'string' ? kernel : null
+      } catch {
+        return null
+      }
     }
-    if (typeof kernel === 'string') {
-      return isSupportedRemoteKernel(kernel) ? { ok: true, value: null } : fail('unsupported', MESSAGE.unsupported)
+    const kernel = await storedKernel()
+    if (kernel !== null) {
+      return isSupportedRemoteKernel(kernel) ? { ok: true, value: { kernel } } : fail('unsupported', MESSAGE.unsupported)
     }
     const checked = await ssh.run(env, [], options)
-    return checked.ok ? { ok: true, value: null } : checked
+    return checked.ok ? { ok: true, value: { kernel: await storedKernel() } } : checked
   }
 
   // Bringing the new terminal to the front is best effort: the terminal is open either way.
@@ -129,7 +134,7 @@ export function createService(deps: ServiceDeps): Service {
 
   // Shell, Logs and Pull: one docker command in a new terminal on the host's anchor workspace. The host must be ready
   // and have an anchor; `argv` is built (and checked) next, so a bad value opens and runs nothing; an SSH host must
-  // then be known to run Linux. The terminal comes to the front.
+  // then be known to run Linux or macOS. The terminal comes to the front.
   async function openCommandTerminal(
     hostId: HostId, title: string, argv: () => string[], focus: FocusContext | null, options: RunOptions,
   ): Promise<Result<Opened>> {
@@ -138,9 +143,9 @@ export function createService(deps: ServiceDeps): Service {
     const resolved = await anchorOf(hostId, focus)
     if (!resolved.ok) return resolved
     const anchor = resolved.value
-    let command: string
+    let args: string[]
     try {
-      command = shellCommand(argv())
+      args = argv()
     } catch (error) {
       if (error instanceof InvalidInputError) return fail('invalid', error.message)
       throw error
@@ -148,12 +153,15 @@ export function createService(deps: ServiceDeps): Service {
     const env = envOf(hostId)
     if (env === null) {
       if (anchor.workspaceId === undefined) return fail('no-workspace', MESSAGE['no-workspace'])
-      const terminalId = await deps.openLocalTerminal({ workspaceId: anchor.workspaceId, title, command })
+      const terminalId = await deps.openLocalTerminal({ workspaceId: anchor.workspaceId, title, command: shellCommand(args) })
       await bringToFront({ handle: terminalId })
       return { ok: true, value: { opened: true, workspace: anchor.name ?? baseName(anchor.path) } }
     }
-    const linux = await linuxKnown(env, options)
-    if (!linux.ok) return linux
+    const known = await kernelKnown(env, options)
+    if (!known.ok) return known
+    // A Linux host gets the plain command; a Mac host, or one whose kernel could not be read back, gets the lookup (plain
+    // POSIX that still prefers docker on PATH).
+    const command = shellCommand(known.value.kernel === 'Linux' ? args : macTerminalArgv(args))
     let handle: string
     try {
       handle = await cli.createTerminal({ environment: env, worktreePath: anchor.path, title, command, focus: true })

@@ -1,8 +1,9 @@
 import {
   Button, Callout, Card, CodeView, Collapsible, EmptyState, IconButton, Input, KeyValue, RelativeTime, Row, Select, Skeleton, Spinner, Stack,
-  Switch, Text, Toolbar, Tree, atom, on, plugin, read, set, settings, update, type OrcaNode, type PanelContext, type Tone, type TreeItem,
+  Switch, Text, Toolbar, Tree, atom, env, on, plugin, read, set, settings, update, type OrcaNode, type PanelContext, type Tone, type TreeItem,
 } from 'orca'
 import { isImageRef } from './docker/commands'
+import { messages, resolveLang, type Lang, type Messages } from './i18n'
 import {
   allowedActions, containerDetails, containerTree, dueForRefresh, hostOptions, imageTree, logRefreshMs, logText, networkTree, nextHost,
   problemCopy, refreshMs, rejectionProblem, resourceDetails, resourceKindOf, runningCount, shownKey, volumeTree, type Allowed,
@@ -37,8 +38,8 @@ const pendingDelete = atom<PendingDelete | null>(null)
 const working = atom(false)
 // Both clear on the next action or a host change.
 const actionProblem = atom<(Target & { problem: Problem }) | null>(null)
-// "Opened logs in <workspace>." after a Logs, Shell or Pull tab opened in the background.
-const openedNote = atom<(Target & { text: string }) | null>(null)
+// "Opened logs in <workspace>." after a Logs, Shell or Pull tab opened in the background; drawn in the language shown.
+const openedNote = atom<(Target & { text: (m: Messages) => string }) | null>(null)
 // Open for the selected container only: it follows the selection and closes when the selection clears.
 const logView = atom<LogView | null>(null)
 const filterText = atom('filter', '')
@@ -49,12 +50,18 @@ const sectionsOpen = atom<Record<Section, boolean>>('sections', SECTIONS_OPEN, {
 const collapsedProjects = atom<string[]>([])
 // Image repositories the person expanded; the others stay collapsed.
 const expandedRepos = atom<string[]>([])
-// The Images section's "Image to pull" field, and why its last Pull was refused (null: it was not).
+// The Images section's "Image to pull" field, and whether its last Pull was refused as not an image name.
 const pullText = atom('')
-const pullError = atom<string | null>(null)
+const pullInvalid = atom(false)
 // The Target id of the pull row's problem and note; no tree key looks like it.
 const PULL_ROW = 'pull-by-name'
-const PULL_INVALID = 'Not an image name. Use one like nginx:latest or ghcr.io/org/app:1.2.'
+// The plugin's Language setting as last read (auto, en, ko, or anything else); with Orca's locale it picks the copy.
+const languageSetting = atom<unknown>(undefined)
+
+// Read while drawing, so a change of the setting draws the panel again; Orca's locale is read as it is.
+function uiLang(): Lang {
+  return resolveLang(read(languageSetting), env.locale)
+}
 
 // Per panel run, reset by setup: plain values the screen does not draw.
 type Run = {
@@ -211,7 +218,9 @@ const sameFocus = (a: FocusContext, b: FocusContext) =>
 async function loadSettings(r: Run): Promise<void> {
   try {
     const values = await settings.get()
-    if (alive(r)) r.settings = values
+    if (!alive(r)) return
+    r.settings = values
+    set(languageSetting, values.language)
   } catch {
     // Keep the last values; refreshMs falls back to the defaults.
   }
@@ -241,7 +250,7 @@ function containerAction(hostId: HostId, action: ContainerAction, containerId: s
 function openTerminal(hostId: HostId, kind: TerminalKind, containerId: string, containerName: string): Promise<void> {
   const target = { hostId, id: containerId }
   return runCommand(target, () => plugin.request('docker.openTerminal', { hostId, kind, containerId, containerName }, DOCKER_REQUEST), false,
-    ({ workspace }) => set(openedNote, { ...target, text: `Opened ${kind} in ${workspace}.` }))
+    ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedTerminal[kind](workspace) }))
 }
 
 // Opens `docker pull <ref>` in a terminal on the host, as Shell does; the note and a problem go to `target`
@@ -249,23 +258,23 @@ function openTerminal(hostId: HostId, kind: TerminalKind, containerId: string, c
 function pullImage(hostId: HostId, targetId: string, ref: string): Promise<void> {
   const target = { hostId, id: targetId }
   return runCommand(target, () => plugin.request('docker.pullTerminal', { hostId, ref }, DOCKER_REQUEST), false,
-    ({ workspace }) => set(openedNote, { ...target, text: `Opened pull: ${ref} in ${workspace}.` }))
+    ({ workspace }) => set(openedNote, { ...target, text: (m) => m.openedPull(ref, workspace) }))
 }
 
 // The same rule the worker applies; a refused name stays in the field with an error under it, and nothing is sent.
 function pullByName(hostId: HostId): void {
   const ref = read(pullText).trim()
   if (!isImageRef(ref)) {
-    set(pullError, PULL_INVALID)
+    set(pullInvalid, true)
     return
   }
-  set(pullError, null)
+  set(pullInvalid, false)
   void pullImage(hostId, PULL_ROW, ref)
 }
 
 function changePullText(text: string): void {
   set(pullText, text)
-  set(pullError, null)
+  set(pullInvalid, false)
 }
 
 // Never forced: Docker refuses an item in use, and its answer shows on the card. A delete that went through
@@ -444,7 +453,7 @@ export function setup(ctx: PanelContext): void {
 }
 
 function problemState(problem: Problem): OrcaNode {
-  const copy = problemCopy(problem)
+  const copy = problemCopy(problem, uiLang())
   return (
     <EmptyState title={copy.title} icon="warning">
       <Text muted>{copy.description}</Text>
@@ -453,7 +462,7 @@ function problemState(problem: Problem): OrcaNode {
 }
 
 function problemCallout(problem: Problem, tone: Tone, key: string): OrcaNode {
-  const copy = problemCopy(problem)
+  const copy = problemCopy(problem, uiLang())
   return (
     <Callout key={key} tone={tone} title={copy.title}>
       <Text>{copy.description}</Text>
@@ -465,14 +474,18 @@ function problemCallout(problem: Problem, tone: Tone, key: string): OrcaNode {
 const ownedBy = (hostId: HostId, id: string) => <T extends Target>(value: T | null): T | null =>
   value !== null && value.hostId === hostId && value.id === id ? value : null
 
+// The note of the item drawn, in the language shown.
+const noteText = (note: { text: (m: Messages) => string } | null, m: Messages): string | null => note === null ? null : note.text(m)
+
 function deleteQuestion(pending: PendingDelete, text: string, busy: boolean): OrcaNode {
+  const m = messages[uiLang()]
   return (
-    <Callout key="confirm" tone="danger" title={`Delete ${pending.name}?`}>
+    <Callout key="confirm" tone="danger" title={m.deleteTitle(pending.name)}>
       <Stack gap="sm">
         <Text>{text}</Text>
         <Row gap="xs">
-          <Button key="confirm-delete" tone="danger" disabled={busy} onPress={confirmDelete}>Delete</Button>
-          <Button key="cancel-delete" variant="ghost" onPress={() => set(pendingDelete, null)}>Cancel</Button>
+          <Button key="confirm-delete" tone="danger" disabled={busy} onPress={confirmDelete}>{m.delete}</Button>
+          <Button key="cancel-delete" variant="ghost" onPress={() => set(pendingDelete, null)}>{m.cancel}</Button>
         </Row>
       </Stack>
     </Callout>
@@ -480,6 +493,8 @@ function deleteQuestion(pending: PendingDelete, text: string, busy: boolean): Or
 }
 
 function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
+  const lang = uiLang()
+  const m = messages[lang]
   const busy = read(working)
   const allowed = allowedActions(container.state)
   const can = (name: keyof Allowed) => !busy && allowed[name]
@@ -491,54 +506,53 @@ function detailsCard(view: HostView, container: ContainerRow): OrcaNode {
   const own = ownedBy(view.hostId, container.id)
   const pending = own(read(pendingDelete))
   const problem = own(read(actionProblem))?.problem ?? null
-  const opened = own(read(openedNote))?.text ?? null
+  const opened = noteText(own(read(openedNote)), m)
   return (
     <Card key="details" title={container.name} description={container.state}>
       <Stack gap="sm">
-        <KeyValue items={containerDetails(container)} />
+        <KeyValue items={containerDetails(container, lang)} />
         <Row gap="sm" align="center" wrap>
-          <Toolbar label="Container actions">
-            <Button key="start" size="sm" icon="play" disabled={!can('start')} onPress={act('start')}>Start</Button>
-            <Button key="stop" size="sm" icon="stop" disabled={!can('stop')} onPress={act('stop')}>Stop</Button>
-            <Button key="restart" size="sm" icon="refresh" disabled={!can('restart')} onPress={act('restart')}>Restart</Button>
-            <Button key="logs" size="sm" icon="file-text" disabled={!can('logs')} onPress={showLogs}>Logs</Button>
-            <Button key="shell" size="sm" icon="terminal" disabled={!can('shell')} onPress={terminal('shell')}>Shell</Button>
-            <Button key="delete" size="sm" icon="delete" tone="danger" variant="outline" disabled={!can('remove')} onPress={askDelete}>Delete</Button>
+          <Toolbar label={m.containerActions}>
+            <Button key="start" size="sm" icon="play" disabled={!can('start')} onPress={act('start')}>{m.start}</Button>
+            <Button key="stop" size="sm" icon="stop" disabled={!can('stop')} onPress={act('stop')}>{m.stop}</Button>
+            <Button key="restart" size="sm" icon="refresh" disabled={!can('restart')} onPress={act('restart')}>{m.restart}</Button>
+            <Button key="logs" size="sm" icon="file-text" disabled={!can('logs')} onPress={showLogs}>{m.logs}</Button>
+            <Button key="shell" size="sm" icon="terminal" disabled={!can('shell')} onPress={terminal('shell')}>{m.shell}</Button>
+            <Button key="delete" size="sm" icon="delete" tone="danger" variant="outline" disabled={!can('remove')} onPress={askDelete}>{m.delete}</Button>
           </Toolbar>
-          {busy ? <Spinner label="Working" /> : null}
+          {busy ? <Spinner label={m.working} /> : null}
         </Row>
         {opened === null ? null : <Text muted size="sm">{opened}</Text>}
-        {pending === null ? null : deleteQuestion(pending, 'The container is removed from the host. This cannot be undone.', busy)}
+        {pending === null ? null : deleteQuestion(pending, m.removeContainer, busy)}
         {problem === null ? null : problemCallout(problem, 'danger', 'action-problem')}
       </Stack>
     </Card>
   )
 }
 
-const TOOLBAR_LABEL: Record<ResourceKind, string> = { image: 'Image actions', volume: 'Volume actions', network: 'Network actions' }
-
 // The card of the selected image tag, volume or network: what it is, Pull (an image with a repository and tag), Delete.
 function resourceCard(view: HostView, details: ResourceDetails): OrcaNode {
+  const m = messages[uiLang()]
   const busy = read(working)
   const { kind, key, title, removeRef, removeBlocked, pullRef } = details
   const askDelete = () => set(pendingDelete, { hostId: view.hostId, id: key, name: title, kind, ref: removeRef })
   const own = ownedBy(view.hostId, key)
   const pending = own(read(pendingDelete))
   const problem = own(read(actionProblem))?.problem ?? null
-  const opened = own(read(openedNote))?.text ?? null
+  const opened = noteText(own(read(openedNote)), m)
   return (
     <Card key="details" title={title}>
       <Stack gap="sm">
         <KeyValue items={details.items} />
         <Row gap="sm" align="center" wrap>
-          <Toolbar label={TOOLBAR_LABEL[kind]}>
+          <Toolbar label={m.resourceActions[kind]}>
             {pullRef === null ? null : (
-              <Button key="pull" size="sm" icon="download" disabled={busy} onPress={() => void pullImage(view.hostId, key, pullRef)}>Pull</Button>
+              <Button key="pull" size="sm" icon="download" disabled={busy} onPress={() => void pullImage(view.hostId, key, pullRef)}>{m.pull}</Button>
             )}
             <Button key="delete" size="sm" icon="delete" tone="danger" variant="outline" disabled={busy || removeBlocked !== null}
-              onPress={askDelete}>Delete</Button>
+              onPress={askDelete}>{m.delete}</Button>
           </Toolbar>
-          {busy ? <Spinner label="Working" /> : null}
+          {busy ? <Spinner label={m.working} /> : null}
         </Row>
         {removeBlocked === null ? null : <Text key="delete-blocked" muted size="sm">{removeBlocked}</Text>}
         {opened === null ? null : <Text muted size="sm">{opened}</Text>}
@@ -551,16 +565,17 @@ function resourceCard(view: HostView, details: ResourceDetails): OrcaNode {
 
 // Before any lines: the problem or a placeholder. After: the lines, under the problem of a later failed refresh.
 function logBody(logs: LogView): OrcaNode {
+  const m = messages[uiLang()]
   if (logs.text === null) {
     if (logs.problem !== null) return problemState(logs.problem)
-    return <Skeleton key="logs-loading" label="Loading logs" lines={3} />
+    return <Skeleton key="logs-loading" label={m.loadingLogs} lines={3} />
   }
   return (
     <Stack gap="xs">
       {logs.problem === null ? null : problemCallout(logs.problem, 'warning', 'logs-problem')}
       {logs.text.trim() === ''
-        ? <Text key="no-logs" muted size="sm">No log output</Text>
-        : <CodeView key="logs-code" label="Logs" code={logs.text} wrap maxHeight="md" />}
+        ? <Text key="no-logs" muted size="sm">{m.noLogs}</Text>
+        : <CodeView key="logs-code" label={m.logs} code={logs.text} wrap maxHeight="md" />}
     </Stack>
   )
 }
@@ -568,17 +583,18 @@ function logBody(logs: LogView): OrcaNode {
 // Under the card: the last lines of the container's logs, refreshed while the panel is visible.
 // "Open in terminal" follows them live in an Orca terminal, as the Logs button did before.
 function logSection(view: HostView, container: ContainerRow, logs: LogView): OrcaNode {
+  const m = messages[uiLang()]
   const busy = read(working)
   return (
     <Stack key="logs" gap="xs">
       <Row key="logs-header" gap="xs" align="center" justify="between" wrap>
-        {logs.takenAt === null ? <Text muted size="xs">Logs</Text> : <Text muted size="xs">Logs updated <RelativeTime at={logs.takenAt} /></Text>}
+        {logs.takenAt === null ? <Text muted size="xs">{m.logs}</Text> : <Text muted size="xs">{m.logsUpdated}<RelativeTime at={logs.takenAt} /></Text>}
         <Row gap="xs" align="center">
-          <IconButton key="refresh-logs" icon="refresh" label="Refresh logs" size="sm" variant="ghost" disabled={logs.loading}
+          <IconButton key="refresh-logs" icon="refresh" label={m.refreshLogs} size="sm" variant="ghost" disabled={logs.loading}
             onPress={() => void refreshLogs()} />
           <Button key="logs-terminal" size="sm" variant="ghost" icon="terminal" disabled={busy}
-            onPress={() => void openTerminal(view.hostId, 'logs', container.id, container.name)}>Open in terminal</Button>
-          <IconButton key="close-logs" icon="close" label="Close logs" size="sm" variant="ghost" onPress={closeLogs} />
+            onPress={() => void openTerminal(view.hostId, 'logs', container.id, container.name)}>{m.openInTerminal}</Button>
+          <IconButton key="close-logs" icon="close" label={m.closeLogs} size="sm" variant="ghost" onPress={closeLogs} />
         </Row>
       </Row>
       {logBody(logs)}
@@ -587,13 +603,15 @@ function logSection(view: HostView, container: ContainerRow, logs: LogView): Orc
 }
 
 // A muted line in place of an empty tree: the host has none, or the filter left none.
-function emptyLine(noun: string, total: number): OrcaNode {
-  return <Text key="empty" muted size="sm">{total === 0 ? `No ${noun}` : `No ${noun} match the filter`}</Text>
+function emptyLine(id: Section, total: number): OrcaNode {
+  const copy = messages[uiLang()].sections[id]
+  return <Text key="empty" muted size="sm">{total === 0 ? copy.none : copy.noMatch}</Text>
 }
 
 function containersBody(view: HostView, snapshot: Snapshot, filter: string): OrcaNode {
+  const lang = uiLang()
   const rows = snapshot.containers
-  const items = containerTree(rows, filter)
+  const items = containerTree(rows, filter, lang)
   const selected = read(selection)
   const container = rows.find((c) => c.id === selected) ?? null
   const logs = read(logView)
@@ -604,7 +622,7 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
       {items.length === 0 ? emptyLine('containers', rows.length) : (
         <Tree
           key="containers-tree"
-          label="Containers"
+          label={messages[lang].sections.containers.title}
           items={items}
           maxHeight="lg"
           // '' keeps the Tree controlled when no container is selected; undefined would let it keep its own pick.
@@ -623,36 +641,35 @@ function containersBody(view: HostView, snapshot: Snapshot, filter: string): Orc
 
 // "Image to pull" and its Pull button, at the top of the Images section, with what came of the last pull.
 function pullRow(view: HostView): OrcaNode {
+  const m = messages[uiLang()]
   const text = read(pullText)
-  const error = read(pullError)
+  const invalid = read(pullInvalid)
   const own = ownedBy(view.hostId, PULL_ROW)
   const problem = own(read(actionProblem))?.problem ?? null
-  const opened = own(read(openedNote))?.text ?? null
+  const opened = noteText(own(read(openedNote)), m)
   return (
     <Stack key="pull-row" gap="xs">
       <Row gap="xs" align="end">
-        <Input key="pull-ref" label="Image to pull" labelHidden placeholder="nginx:latest" value={text} invalid={error !== null}
+        {/* The placeholder is an example image name, the same in every language. */}
+        <Input key="pull-ref" label={m.imageToPull} labelHidden placeholder="nginx:latest" value={text} invalid={invalid}
           onChange={changePullText} />
         <Button key="pull-by-name" size="sm" icon="download" disabled={read(working) || text.trim() === ''}
-          onPress={() => pullByName(view.hostId)}>Pull</Button>
+          onPress={() => pullByName(view.hostId)}>{m.pull}</Button>
       </Row>
-      {error === null ? null : <Text key="pull-error" tone="danger" size="sm">{error}</Text>}
+      {invalid ? <Text key="pull-error" tone="danger" size="sm">{m.notAnImage}</Text> : null}
       {opened === null ? null : <Text key="pull-opened" muted size="sm">{opened}</Text>}
       {problem === null ? null : problemCallout(problem, 'danger', 'pull-problem')}
     </Stack>
   )
 }
 
-const RESOURCE_SECTION: Record<ResourceKind, { label: string; noun: string }> = {
-  image: { label: 'Images', noun: 'images' }, volume: { label: 'Volumes', noun: 'volumes' }, network: { label: 'Networks', noun: 'networks' },
-}
-
 // A section's tree and, under it, the card of its selected row. Images also get the pull row, and their repository
 // rows toggle like Compose projects.
 function resourceBody(view: HostView, snapshot: Snapshot, kind: ResourceKind, items: TreeItem[], total: number): OrcaNode {
-  const { label, noun } = RESOURCE_SECTION[kind]
+  const lang = uiLang()
+  const id = SECTION_OF[kind]
   const selected = read(selection)
-  const details = selected !== null && resourceKindOf(selected) === kind ? resourceDetails(snapshot, selected) : null
+  const details = selected !== null && resourceKindOf(selected) === kind ? resourceDetails(snapshot, selected, lang) : null
   const repos = read(expandedRepos)
   const groups = kind !== 'image' ? {} : {
     expanded: items.filter((item) => repos.includes(item.key)).map((item) => item.key),
@@ -661,8 +678,8 @@ function resourceBody(view: HostView, snapshot: Snapshot, kind: ResourceKind, it
   return (
     <Stack gap="sm">
       {kind === 'image' ? pullRow(view) : null}
-      {items.length === 0 ? emptyLine(noun, total) : (
-        <Tree key={`${noun}-tree`} label={label} items={items} maxHeight="lg" selected={details?.key ?? ''}
+      {items.length === 0 ? emptyLine(id, total) : (
+        <Tree key={`${id}-tree`} label={messages[lang].sections[id].title} items={items} maxHeight="lg" selected={details?.key ?? ''}
           onSelect={({ key }) => pickItem(key)} {...groups} />
       )}
       {details === null ? null : resourceCard(view, details)}
@@ -671,8 +688,9 @@ function resourceBody(view: HostView, snapshot: Snapshot, kind: ResourceKind, it
 }
 
 // A closed section draws nothing inside, so hundreds of images cost nothing until it opens.
-function section(id: Section, title: string, description: string, body: () => OrcaNode): OrcaNode {
+function section(id: Section, description: string, body: () => OrcaNode): OrcaNode {
   const open = { ...SECTIONS_OPEN, ...read(sectionsOpen) }[id] === true
+  const title = messages[uiLang()].sections[id].title
   return (
     <Collapsible key={id} title={title} description={description} open={open} onChange={(next) => setSectionOpen(id, next)}>
       {open ? body() : null}
@@ -681,42 +699,46 @@ function section(id: Section, title: string, description: string, body: () => Or
 }
 
 function hostBody(): OrcaNode {
+  const lang = uiLang()
+  const m = messages[lang]
   const hosts = read(hostList)
   if (hosts === null) {
     const problem = read(hostsProblem)
-    return problem === null ? <Skeleton label="Loading hosts" lines={3} /> : null
+    return problem === null ? <Skeleton label={m.loadingHosts} lines={3} /> : null
   }
   const view = read(hostView)
   if (view === null) {
     return (
-      <EmptyState title="No host is ready" icon="info">
-        <Text muted>Pick a host above when one becomes ready.</Text>
+      <EmptyState title={m.noHostTitle} icon="info">
+        <Text muted>{m.noHostDescription}</Text>
       </EmptyState>
     )
   }
   const snapshot = view.snapshot
   if (snapshot === null) {
     if (view.problem !== null) return problemState(view.problem)
-    return <Skeleton label="Loading containers" lines={4} />
+    return <Skeleton label={m.loadingContainers} lines={4} />
   }
   const filter = read(filterText)
   const { containers, images, volumes, networks } = snapshot
   return (
     <Stack gap="sm">
       {view.problem === null ? null : problemCallout(view.problem, 'warning', 'snapshot-problem')}
-      {section('containers', 'Containers', `${runningCount(containers)} running / ${containers.length}`,
+      {section('containers', m.runningOfTotal(runningCount(containers), containers.length),
         () => containersBody(view, snapshot, filter))}
-      {section('images', 'Images', `${images.length}`,
-        () => resourceBody(view, snapshot, 'image', imageTree(images, filter), images.length))}
-      {section('volumes', 'Volumes', `${volumes.length}`,
+      {section('images', `${images.length}`,
+        () => resourceBody(view, snapshot, 'image', imageTree(images, filter, lang), images.length))}
+      {section('volumes', `${volumes.length}`,
         () => resourceBody(view, snapshot, 'volume', volumeTree(volumes, filter), volumes.length))}
-      {section('networks', 'Networks', `${networks.length}`,
+      {section('networks', `${networks.length}`,
         () => resourceBody(view, snapshot, 'network', networkTree(networks, filter), networks.length))}
     </Stack>
   )
 }
 
 export default function Panel() {
+  const lang = uiLang()
+  const m = messages[lang]
   const hosts = read(hostList)
   const hostId = read(selectedHost)
   const view = read(hostView)
@@ -727,26 +749,26 @@ export default function Panel() {
     <Stack gap="sm">
       <Row gap="xs" align="end">
         <Select
-          label="Host"
-          options={hostOptions(hosts ?? [])}
+          label={m.host}
+          options={hostOptions(hosts ?? [], lang)}
           value={hostId ?? undefined}
-          placeholder="Choose a host"
+          placeholder={m.chooseHost}
           onChange={(value) => {
             const picked = hosts?.find((h) => h.id === value)
             if (picked !== undefined && picked.id !== read(selectedHost)) selectHost(picked.id)
           }}
         />
-        <IconButton icon="refresh" label="Refresh" disabled={refreshing} onPress={() => void refreshAll()} />
+        <IconButton icon="refresh" label={m.refresh} disabled={refreshing} onPress={() => void refreshAll()} />
       </Row>
       <Row gap="sm" align="center" justify="between" wrap>
-        <Switch label="Follow focused workspace" checked={read(followFocus)} onChange={setFollow} />
-        {takenAt === undefined ? null : <Text muted size="xs">Updated <RelativeTime at={takenAt} /></Text>}
+        <Switch label={m.followFocus} checked={read(followFocus)} onChange={setFollow} />
+        {takenAt === undefined ? null : <Text muted size="xs">{m.updated}<RelativeTime at={takenAt} /></Text>}
       </Row>
       <Input
-        label="Filter"
+        label={m.filter}
         labelHidden
         type="search"
-        placeholder="Filter containers, images…"
+        placeholder={m.filterPlaceholder}
         value={read(filterText)}
         onChange={changeFilter}
       />

@@ -1,5 +1,5 @@
 import type { FocusContext, HostId, HostInfo, HostStatus } from './protocol'
-import { isSupportedLocalPlatform, isSupportedRemoteKernel } from './platform'
+import { isSupportedLocalPlatform, isSupportedRemoteKernel, localName, localNameInText } from './platform'
 import { CliError, type OrcaCli } from './remote/orca-cli'
 import { kernelKey, type KeyValueStore } from './remote/ssh'
 
@@ -72,7 +72,7 @@ export function createHosts(deps: HostsDeps): Hosts {
       envs = await cli.listSshEnvironments({ timeoutMs: LISTING_TIMEOUT_MS })
     } catch (error) {
       if (!(error instanceof CliError)) throw error
-      if (!listingDown) deps.log(`Listing SSH hosts failed, showing this Mac only: ${error.code}: ${error.message}`)
+      if (!listingDown) deps.log(`Listing SSH hosts failed, showing ${localNameInText(deps.platform)} only: ${error.code}: ${error.message}`)
       envs = []
       listed = false
     }
@@ -92,7 +92,7 @@ export function createHosts(deps: HostsDeps): Hosts {
   }
 
   const localHost = (): HostInfo =>
-    ({ id: 'local', label: 'This Mac', kind: 'local', status: isSupportedLocalPlatform(deps.platform) ? 'ready' : 'unsupported' })
+    ({ id: 'local', label: localName(deps.platform), kind: 'local', status: isSupportedLocalPlatform(deps.platform) ? 'ready' : 'unsupported' })
 
   // Status is derived on every call: a kernel recorded by an ssh run shows up without a new read.
   // Off a supported local platform nothing is tried, SSH hosts included (spec 2.1). Orca's workspace listing of a

@@ -31,7 +31,7 @@ function memStore() {
 }
 
 function setup(reply: (call: Call) => Partial<Out> | Promise<Partial<Out>> = () => ({}),
-  opts: { now?: () => number; sshPath?: string; nonces?: string[]; storage?: KeyValueStore } = {}) {
+  opts: { now?: () => number; sshPath?: string; nonces?: string[]; storage?: KeyValueStore; localName?: string } = {}) {
   const calls: Call[] = []
   const { data, store: mem } = memStore()
   const store = opts.storage ?? mem
@@ -46,6 +46,7 @@ function setup(reply: (call: Call) => Partial<Out> | Promise<Partial<Out>> = () 
     exec, storage: store, now: opts.now ?? (() => 0),
     randomHex: () => nonces[Math.min(hexCalls++, nonces.length - 1)] ?? NONCE,
     ...(opts.sshPath ? { sshPath: opts.sshPath } : {}),
+    localName: opts.localName ?? 'this Mac',
   })
   return { runner, calls, data }
 }
@@ -55,8 +56,9 @@ const READY = marker('READY', 'Linux')
 const BEGIN = marker('BEGIN', '1')
 const section = (r: CommandResult, nonce: string) => [marker('SEC', r.name, nonce), ...r.lines, marker('RC', `${r.name} ${r.code}`, nonce)]
 const output = (...lines: string[]) => `${lines.join('\n')}\n`
-const completeFor = (nonce: string, ...results: CommandResult[]) => output(marker('READY', 'Linux', nonce), marker('BEGIN', '1', nonce),
+const completeOn = (kernel: string, nonce: string, ...results: CommandResult[]) => output(marker('READY', kernel, nonce), marker('BEGIN', '1', nonce),
   ...results.flatMap((r) => section(r, nonce)), marker('END', '2', nonce))
+const completeFor = (nonce: string, ...results: CommandResult[]) => completeOn('Linux', nonce, ...results)
 const complete = (...results: CommandResult[]) => completeFor(NONCE, ...results)
 const nonceOf = (call: Call): string => /^N=([0-9a-f]{8})$/m.exec(call.input)?.[1] ?? ''
 const OPTS = { deadline: 100_000 }
@@ -206,33 +208,49 @@ describe('ssh runner', () => {
     assert.equal(kernelKey(ENV), 'kernel:GPU1')
   })
 
-  test('Darwin is unsupported, with the kernel stored', async () => {
-    const t = setup(() => ({ stdout: output(marker('READY', 'Darwin')) }))
-    const res = await t.runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
-    assert.equal(res.ok ? 'ok' : res.problem.kind, 'unsupported')
+  test('a macOS host (Darwin) is supported: the run completes and the kernel is stored', async () => {
+    const t = setup(() => ({ stdout: completeOn('Darwin', NONCE, { name: 'action', code: 0, lines: [ID] }) }))
+    assert.deepEqual(await t.runner.run(ENV, [STOP], OPTS), { ok: true, value: [{ name: 'action', code: 0, lines: [ID] }] })
     assert.equal(t.data.get(kernelKey(ENV)), 'Darwin')
   })
 
-  test('the kernel in the unsupported message has no escape sequences', async () => {
-    const t = setup(() => ({ stdout: output(marker('READY', 'Dar\u001b[1mwin\u0007')) }))
+  test('FreeBSD is unsupported, with the kernel stored', async () => {
+    const t = setup(() => ({ stdout: output(marker('READY', 'FreeBSD')) }))
     const res = await t.runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
-    assert.deepEqual(res, { ok: false, problem: { kind: 'unsupported', message: 'Remote kernel Darwin is not supported' } })
+    assert.equal(res.ok ? 'ok' : res.problem.kind, 'unsupported')
+    assert.equal(t.data.get(kernelKey(ENV)), 'FreeBSD')
+  })
+
+  test('the kernel in the unsupported message has no escape sequences', async () => {
+    const t = setup(() => ({ stdout: output(marker('READY', 'Free\u001b[1mBSD\u0007')) }))
+    const res = await t.runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
+    assert.deepEqual(res, { ok: false, problem: { kind: 'unsupported', message: 'Remote kernel FreeBSD is not supported' } })
   })
 
   test('a kernel that cannot be stored does not change the answer', async () => {
     const storage: KeyValueStore = { get: async () => undefined, set: async () => { throw new Error('storage down') }, delete: async () => {} }
     const t = setup(() => ({ stdout: complete({ name: 'action', code: 0, lines: [ID] }) }), { storage })
     assert.deepEqual(await t.runner.run(ENV, [STOP], OPTS), { ok: true, value: [{ name: 'action', code: 0, lines: [ID] }] })
-    const darwin = setup(() => ({ stdout: output(marker('READY', 'Darwin')) }), { storage })
-    const res = await darwin.runner.run(ENV, [STOP], OPTS)
+    const other = setup(() => ({ stdout: output(marker('READY', 'FreeBSD')) }), { storage })
+    const res = await other.runner.run(ENV, [STOP], OPTS)
     assert.equal(res.ok ? 'ok' : res.problem.kind, 'unsupported')
   })
 
   test('a READY line of another nonce is not ours', async () => {
-    const t = setup(() => ({ stdout: output(marker('READY', 'Darwin', '99999999')), code: 0 }))
+    const t = setup(() => ({ stdout: output(marker('READY', 'FreeBSD', '99999999')), code: 0 }))
     const res = await t.runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
     assert.equal(res.ok ? 'ok' : res.problem.kind, 'failed')
     assert.equal(t.data.has(kernelKey(ENV)), false)
+  })
+
+  test('ssh messages name the local computer as the worker says (this Mac, or this computer on Linux)', async () => {
+    const onLinux = (stderr: string) => setup(() => ({ code: 255, stderr }), { localName: 'this computer' }).runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
+    assert.deepEqual(await onLinux('ssh: Could not resolve hostname gpu1: Name or service not known\n'), { ok: false, problem: { kind: 'ssh-failed',
+      message: 'No ssh host named "GPU1" on this computer. Add a "Host GPU1" entry with key login to ~/.ssh/config.' } })
+    const login = await onLinux('me@gpu1: Permission denied (publickey).')
+    assert.match(login.ok ? '' : login.problem.message, /once in a terminal on this computer/)
+    const spawn = await setup(() => ({ spawnError: 'spawn /usr/bin/ssh ENOENT' }), { localName: 'this computer' }).runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
+    assert.deepEqual(spawn, { ok: false, problem: { kind: 'ssh-failed', message: 'The ssh command could not start on this computer: spawn /usr/bin/ssh ENOENT.' } })
   })
 
   const sshFailure = async (stderr: string) => {
@@ -243,7 +261,7 @@ describe('ssh runner', () => {
   }
 
   test('an unknown host name is ssh-failed with the ~/.ssh/config hint', async () => {
-    const res = await sshFailure('ssh: Could not resolve hostname a6000: nodename nor servname provided, or not known\n')
+    const res = await sshFailure('ssh: Could not resolve hostname gpu1: nodename nor servname provided, or not known\n')
     assert.deepEqual(res, { ok: false, problem: { kind: 'ssh-failed',
       message: 'No ssh host named "GPU1" on this Mac. Add a "Host GPU1" entry with key login to ~/.ssh/config.' } })
   })
@@ -251,9 +269,9 @@ describe('ssh runner', () => {
   test('a login that needs a prompt is ssh-failed with the key hint', async () => {
     const message = 'ssh could not log in to "GPU1" without a prompt. Run `ssh GPU1` once in a terminal on this Mac and use a key that needs no typing (ssh-agent).'
     for (const stderr of [
-      'me@a6000: Permission denied (publickey,password).',
+      'me@gpu1: Permission denied (publickey,password).',
       'Host key verification failed.',
-      'Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures\nme@a6000: No more authentication methods to try.',
+      'Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures\nme@gpu1: No more authentication methods to try.',
       'Load key "/Users/me/.ssh/id_ed25519": incorrect PASSPHRASE',
     ]) {
       assert.deepEqual(await sshFailure(stderr), { ok: false, problem: { kind: 'ssh-failed', message } }, stderr)
@@ -281,7 +299,7 @@ describe('ssh runner', () => {
   })
 
   test('code 255 after READY is not an ssh failure', async () => {
-    const t = setup(() => ({ code: 255, stdout: output(READY), stderr: 'Connection to a6000 closed by remote host.' }))
+    const t = setup(() => ({ code: 255, stdout: output(READY), stderr: 'Connection to gpu1 closed by remote host.' }))
     const res = await t.runner.run(ENV, SNAPSHOT_COMMANDS, OPTS)
     assert.deepEqual(res, { ok: false, problem: { kind: 'failed', message: 'The ssh session to "GPU1" ended before docker finished.' } })
     assert.equal(t.data.get(kernelKey(ENV)), 'Linux')
@@ -316,10 +334,10 @@ describe('ssh runner', () => {
     const UNKNOWN = { ok: false, problem: { kind: 'unknown-result', message: 'sent; result unknown' } }
     const cases: [string, Partial<Out>][] = [
       ['timed out, nothing read', { code: null, timedOut: true, stdout: '' }],
-      ['timed out, ssh ended with 255', { code: 255, timedOut: true, stdout: '', stderr: 'ssh: Could not resolve hostname a6000' }],
+      ['timed out, ssh ended with 255', { code: 255, timedOut: true, stdout: '', stderr: 'ssh: Could not resolve hostname gpu1' }],
       ['overflow', { code: null, overflow: true, stdout: output(READY, BEGIN, marker('SEC', 'action')) }],
       ['overflow, nothing parsed', { code: null, overflow: true, stdout: 'x'.repeat(100) }],
-      ['code 255 after READY, no BEGIN', { code: 255, stdout: output(READY), stderr: 'Connection to a6000 closed by remote host.' }],
+      ['code 255 after READY, no BEGIN', { code: 255, stdout: output(READY), stderr: 'Connection to gpu1 closed by remote host.' }],
       ['code 0 after READY, no BEGIN', { code: 0, stdout: output(READY) }],
     ]
     for (const [name, reply] of cases) {
@@ -348,11 +366,11 @@ describe('ssh runner', () => {
   })
 
   test('an action keeps its answer when nothing could have been sent', async () => {
-    const pure = await setup(() => ({ code: 255, stderr: 'ssh: Could not resolve hostname a6000: nodename nor servname provided' }))
+    const pure = await setup(() => ({ code: 255, stderr: 'ssh: Could not resolve hostname gpu1: nodename nor servname provided' }))
       .runner.run(ENV, [STOP], OPTS)
     assert.equal(pure.ok ? 'ok' : pure.problem.kind, 'ssh-failed')
-    const darwin = await setup(() => ({ code: null, timedOut: true, stdout: output(marker('READY', 'Darwin')) })).runner.run(ENV, [STOP], OPTS)
-    assert.equal(darwin.ok ? 'ok' : darwin.problem.kind, 'unsupported')
+    const other = await setup(() => ({ code: null, timedOut: true, stdout: output(marker('READY', 'FreeBSD')) })).runner.run(ENV, [STOP], OPTS)
+    assert.equal(other.ok ? 'ok' : other.problem.kind, 'unsupported')
     const ended = await setup(() => ({ code: 0, stdout: '' })).runner.run(ENV, [STOP], OPTS)
     assert.equal(ended.ok ? 'ok' : ended.problem.kind, 'failed')
   })
@@ -365,7 +383,7 @@ describe('ssh runner', () => {
   })
 
   test('a run we timed out or aborted is never classified by its stderr', async () => {
-    const stderr = 'ssh: Could not resolve hostname a6000: nodename nor servname provided'
+    const stderr = 'ssh: Could not resolve hostname gpu1: nodename nor servname provided'
     for (const commands of [SNAPSHOT_COMMANDS, [logsCommand(ID)]]) {
       const late = await setup(() => ({ code: 255, timedOut: true, stderr })).runner.run(ENV, commands, OPTS)
       assert.equal(late.ok ? 'ok' : late.problem.kind, 'timeout')

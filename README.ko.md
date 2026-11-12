@@ -3,7 +3,7 @@
 ![이 Mac과 SSH 호스트의 Containers 패널](assets/cover.png)
 
 [Orca](https://github.com/stablyai/orca) 사이드바 패널에서 Docker 컨테이너를 보고 관리합니다. 이 Mac과
-Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너, 이미지, 볼륨, 네트워크를 볼 수 있습니다. 컨테이너는
+Linux·macOS SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너, 이미지, 볼륨, 네트워크를 볼 수 있습니다. 컨테이너는
 시작, 중지, 재시작하거나 로그를 보고 셸을 열고 삭제할 수 있습니다. 이미지, 볼륨, 네트워크는 삭제할 수 있고,
 이미지는 Orca 터미널에서 pull할 수 있습니다.
 
@@ -38,12 +38,19 @@ Linux SSH 호스트 모두 지원합니다. 호스트를 고르면 컨테이너,
   앞으로 가져오려고 시도합니다.
 - **자동 새로고침**은 패널이 보일 때만 합니다. 이 Mac은 10초, SSH 호스트는 60초 간격입니다. 플러그인
   Settings에서 `refreshLocalSeconds`(3–600)와 `refreshRemoteSeconds`(15–3600)로 바꿀 수 있습니다.
+- **언어:** 패널은 Orca의 UI 언어를 따릅니다. Orca가 한국어이면 한국어로, 그 밖에는 영어로 표시합니다.
+  플러그인 Settings의 **Language**(`language`)에서 Follow Orca(`auto`, 기본값), English, 한국어 중 하나를 고를 수
+  있습니다. Docker와 ssh가 보내는 메시지(데몬 오류, ssh가 실패한 이유)와 컨테이너 상태("Up 5 days")는 받은
+  그대로 영어로 표시합니다. 이 문서의 버튼과 메시지 이름은 영어 화면 기준입니다.
 
 ## 필요한 것
 
-- macOS의 Orca 1.4.255 이상
+- macOS 또는 Linux의 Orca 1.4.255 이상. Linux에서는 이 문서의 "이 Mac"을 패널이 "This computer"(한국어 화면에서는 "이 컴퓨터")로 부르고, 플러그인은
+  Orca CLI를 `orca-ide`(Orca가 `ORCA_CLI_COMMAND`를 주면 그것)로 실행합니다. Linux에서 그냥 `orca`는 보통 GNOME 화면
+  낭독기라서 쓰지 않습니다.
 - 이 Mac과, 사용할 SSH 호스트마다 `docker` 설치
-- Orca의 SSH 호스트 기능으로 추가한 Linux 호스트
+- Orca의 SSH 호스트 기능으로 추가한 Linux 또는 macOS 호스트. Mac 호스트는 그 Mac에서 Docker Desktop이 실행 중이어야
+  합니다(Docker Desktop은 로그인한 세션에서만 데몬을 띄웁니다).
 - SSH 호스트마다 이 Mac의 `~/.ssh/config`에 Orca 호스트 이름과 똑같은 `Host` 항목. 그 항목은 프롬프트 없이 키로
   로그인해야 합니다(예: ssh-agent에 올린 키). 확인하려면 이 Mac의 터미널에서
   `ssh -o BatchMode=yes <호스트 이름> true`를 실행해 보세요. 오류 없이 끝나야 합니다. 호스트 이름은 영문자, 숫자,
@@ -57,19 +64,22 @@ Orca에서 **Settings → Plugins**를 열고 **Add plugin → From a Git URL…
 저장소 주소를 붙여 넣어 설치합니다.
 
 ```text
-https://github.com/choihjin/orca-containers#v0.2.0
+https://github.com/choihjin/orca-containers#v0.3.0
 ```
 
-터미널에서는 `orca plugin install choihjin/orca-containers@v0.2.0`으로도 설치할 수 있습니다.
+터미널에서는 `orca plugin install choihjin/orca-containers@v0.3.0`으로도 설치할 수 있습니다(Linux에서는 `orca-ide plugin install …`).
 
 Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. 확인한 뒤 켜세요.
 
 ## 동작 방식
 
 - **이 Mac:** 플러그인 워커가 `docker` 명령을 직접 실행합니다.
-- **이 Mac에서 `docker` 찾기:** `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`에 `docker`가 없으면 워커가
-  `/bin/zsh -lc 'command -v docker'`를 실행합니다. 이때 zsh 로그인 시작 파일(`~/.zshenv`, `~/.zprofile`,
-  `~/.zlogin`)이 실행됩니다. 찾은 경로는 다시 쓰고, 찾지 못하는 동안은 새로 고칠 때마다 다시 실행합니다.
+- **이 Mac에서 `docker` 찾기:** `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `/snap/bin`에 `docker`가 없으면
+  워커가 `<셸> -lc 'command -v docker'`를 실행합니다. 셸은 `$SHELL`이 sh, bash, zsh, dash, ksh이면 그것, 아니면
+  `/bin/zsh`, 그것도 없으면 `/bin/sh`입니다. 이때 그 셸의 로그인 시작 파일이 실행됩니다(zsh는 `~/.zshenv`,
+  `~/.zprofile`, `~/.zlogin`, bash는 `~/.bash_profile`, `~/.bash_login`, `~/.profile` 중 처음 있는 파일, sh는 `/etc/profile`과
+  `~/.profile`). 찾은 경로는 다시 쓰고, 찾지 못하는 동안은
+  새로 고칠 때마다 다시 실행합니다.
 - **SSH 호스트:** 목록, 동작(삭제 포함), 패널 안의 로그는 이 Mac에서 `ssh <호스트 이름>`을 실행합니다. ssh 접속 대상은
   Orca 호스트 이름 그대로이고, 그 호스트의 `sh`에 정해진 스크립트를 보냅니다. 터미널은 열지 않습니다.
   ssh만 있으면 되고, Orca가 그 호스트에 연결되는지나 그 호스트에 워크스페이스가 있는지는 상관없습니다.
@@ -102,12 +112,19 @@ Orca는 실행 전에 플러그인이 요청하는 권한을 보여 줍니다. �
   잘리지 않고 보입니다.
 - SSH 호스트의 로그인 셸 시작 파일이 tmux나 screen을 자동으로 붙이면, Shell, Open in terminal, Pull의 docker
   명령이 그 프로그램에 입력될 수 있습니다.
+- Linux의 Orca는 단위 테스트로만 확인했고, 실제 Linux 데스크톱에서는 확인하지 않았습니다.
+- "3분 전" 같은 상대 시간은 Orca가 그리므로, 언어 설정과 상관없이 Orca의 화면 언어를 따릅니다.
+- 워커는 자기 환경 그대로 `docker`를 실행합니다. 셸 시작 파일에서만 설정한 `DOCKER_HOST`(rootless Docker, colima
+  등)는 보지 못해서, 터미널에서는 되는데 패널에는 Docker가 꺼져 있다고 나올 수 있습니다.
+- macOS SSH 호스트는 원격 Mac을 흉내 낸 셸로만 시험했고, 실제 원격 Mac에서는 확인하지 않았습니다. Mac 호스트에서는
+  docker를 PATH, /usr/local/bin, /opt/homebrew/bin, Docker Desktop 앱 번들 순서로 찾습니다. 다른 위치에 설치한
+  docker는 찾지 못합니다. Mac에는 `timeout` 명령이 없어서, 멈춘 docker 명령은 20초가 아니라 ssh 제한인 60초까지
+  기다립니다.
 
 ## v1에 없는 것
 
-이후 버전에서 하려는 일입니다. 각 항목은 착수 전에 시험으로 확인합니다. Compose up/down, Linux나 Windows의
-Orca, macOS SSH 호스트, 1.4.255보다 오래된 Orca, 한국어 UI, 로그인 셸이 tmux나 screen을 자동으로 붙이는 SSH
-호스트 감지.
+이후 버전에서 하려는 일입니다. 각 항목은 착수 전에 시험으로 확인합니다. Compose up/down, Windows의
+Orca, 1.4.255보다 오래된 Orca, 로그인 셸이 tmux나 screen을 자동으로 붙이는 SSH 호스트 감지.
 
 ## 개발
 
@@ -117,6 +134,8 @@ pnpm test        # orca plugin test .
 pnpm typecheck   # Orca 타입을 생성한 뒤 tsc 실행
 orca plugin validate .
 ```
+
+Linux에서는 위 명령의 `orca`를 `orca-ide`로 바꿔 쓰세요.
 
 아이콘, 커버, 스크린샷은 `assets/src`의 HTML 페이지로 만듭니다. `assets/src/render.sh shots`는 check 시나리오의 패널을
 찍고(Orca 창을 숨기거나 최소화해야 함), `assets/src/render.sh images`는 headless Chrome으로 PNG를 만듭니다.

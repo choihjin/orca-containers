@@ -4,6 +4,7 @@ import {
   afterEach, assert, hostError, mockHost, mount, test, type MockRequests, type MountOptions, type TestPanel, type TreeSnapshot,
 } from 'orca/testing'
 import type { ContainerRow, ContainerState, HostId, HostInfo, Result, Snapshot } from './protocol'
+import { messages } from './i18n'
 import * as panel from './panel'
 
 const WEB = 'aaaaaaaaaaaa'
@@ -67,9 +68,12 @@ afterEach(async () => {
 
 async function open(
   overrides: MockRequests = {},
-  options: { settings?: Record<string, number>; persisted?: MountOptions['persisted'] } = {},
+  options: { settings?: Record<string, number | string>; persisted?: MountOptions['persisted']; locale?: string } = {},
 ): Promise<TestPanel> {
-  view = await mount(panel, { host: mockHost({ requests: requests(overrides), settings: options.settings }), persisted: options.persisted })
+  const host = mockHost({ requests: requests(overrides), settings: options.settings })
+  // No locale given: the test kit's own default (`en`).
+  const locale = options.locale === undefined ? {} : { locale: options.locale }
+  view = await mount(panel, { host, persisted: options.persisted, ...locale })
   return view
 }
 const sent = (v: TestPanel, name: string): Sent[] =>
@@ -1709,5 +1713,319 @@ test('the same image tagged in two repositories is deleted by the reference of t
   assert.ok(v.find({ label: 'Delete myreg/nginx:latest?' }), v.summary().join('\n'))
   await v.press({ testId: 'confirm-delete' })
   assert.deepEqual(sent(v, 'docker.removeResource').map((c) => c.input), [{ hostId: 'local', kind: 'image', ref: 'myreg/nginx:latest' }])
+  clean(v)
+})
+
+// Korean. The panel follows Orca's UI language unless its Language setting picks one; the copy comes from i18n.ts.
+
+const TEXT_PROPS = new Set(['label', 'title', 'description', 'placeholder'])
+// Every word the panel draws: text, and the label, title, description and placeholder props, those of Tree items,
+// Select options and KeyValue items included.
+function drawnWords(v: TestPanel): string[] {
+  const words: string[] = []
+  const fromProps = (value: unknown, name: string | null): void => {
+    if (typeof value === 'string') {
+      if (name !== null && TEXT_PROPS.has(name)) words.push(value)
+    } else if (Array.isArray(value)) {
+      for (const item of value) fromProps(item, null)
+    } else if (typeof value === 'object' && value !== null) {
+      for (const [key, item] of Object.entries(value)) fromProps(item, key)
+    }
+  }
+  const walk = (node: TreeSnapshot | string | null | undefined): void => {
+    if (node === null || node === undefined) return
+    if (typeof node === 'string') {
+      words.push(node)
+      return
+    }
+    fromProps(node.props ?? {}, null)
+    for (const child of node.children ?? []) walk(child)
+  }
+  walk(v.tree())
+  return words
+}
+// A test per English catalog entry: the exact string, or for a function its text around any values (and with 1s,
+// for a singular). The product words both catalogs share (SSH, Shell, Pull, Compose, ID) are not English left over.
+function englishCopy(): ((word: string) => boolean)[] {
+  const MARK = '\u0000'
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const tests: ((word: string) => boolean)[] = []
+  const visit = (en: unknown, ko: unknown): void => {
+    if (typeof en === 'string') {
+      if (en !== ko) tests.push((word) => word.trim() === en.trim())
+    } else if (typeof en === 'function') {
+      const fn = en as (...args: unknown[]) => string
+      const pattern = new RegExp(`^${escape(fn(...Array.from({ length: fn.length }, () => MARK))).split(MARK).join('.+')}$`)
+      const singular = fn(...Array.from({ length: fn.length }, () => 1))
+      tests.push((word) => pattern.test(word.trim()) || word.trim() === singular)
+    } else if (typeof en === 'object' && en !== null) {
+      for (const [key, child] of Object.entries(en)) visit(child, (ko as Record<string, unknown>)[key])
+    }
+  }
+  visit(messages.en, messages.ko)
+  return tests
+}
+const ENGLISH = englishCopy()
+const englishLeft = (v: TestPanel) => drawnWords(v).filter((word) => ENGLISH.some((isEnglish) => isEnglish(word)))
+const HANGUL = /[가-힣]/
+const KO_CONTAINERS = { type: 'Tree', label: '컨테이너' }
+
+// The host bar, the sections, a container's card, its delete question and its log view.
+async function assertKorean(v: TestPanel): Promise<void> {
+  const host = v.find({ label: '호스트' })
+  assert.deepEqual([host?.type, host?.props.placeholder, v.valueOf({ label: '호스트' })], ['Select', '호스트 선택', 'local'])
+  assert.deepEqual(host?.props.options, [{ value: 'local', label: '이 Mac' }, { value: 'ssh:GPU1', label: 'GPU1 (SSH)' }])
+  assert.equal(v.find({ label: '새로고침' })?.type, 'IconButton')
+  assert.equal(v.valueOf({ label: '포커스된 워크스페이스 따라가기' }), true)
+  assert.ok(v.find({ text: /^마지막 갱신/ }), v.summary().join('\n'))
+  const filter = v.find({ label: '필터' })
+  assert.deepEqual([filter?.type, filter?.props.placeholder], ['Input', '컨테이너, 이미지 필터…'])
+  const shown = ['컨테이너', '이미지', '볼륨', '네트워크'].map((label) => [label, v.find(section(label))?.props.description])
+  assert.deepEqual(shown, [['컨테이너', '2개 중 1개 실행 중'], ['이미지', '2'], ['볼륨', '1'], ['네트워크', '1']])
+  assert.ok(v.summary().includes('Tree "컨테이너": 2 top-level item(s)'), v.summary().join('\n'))
+
+  await v.selectItem(KO_CONTAINERS, DB)
+  assert.equal(card(v)?.label, 'db')
+  assert.equal(v.find({ type: 'Toolbar' })?.label, '컨테이너 작업')
+  assert.deepEqual(ACTIONS.map((id) => v.find({ testId: id })?.text), ['시작', '중지', '재시작', '로그', 'Shell', '삭제'])
+  assert.deepEqual(v.find({ type: 'KeyValue' })?.props.items, [
+    { label: '이미지', value: 'db:latest' }, { label: '상태', value: 'Exited (0) 1 hour ago' }, { label: 'ID', value: DB, code: true },
+  ])
+  await v.press({ testId: 'delete' })
+  assert.ok(v.summary().includes('Callout danger "db 삭제"'), v.summary().join('\n'))
+  assert.match(v.find({ type: 'Callout' })?.text ?? '', /호스트에서 컨테이너를 삭제합니다\. 되돌릴 수 없습니다\./)
+  assert.deepEqual([v.find({ testId: 'confirm-delete' })?.text, v.find({ testId: 'cancel-delete' })?.text], ['삭제', '취소'])
+  await v.press({ testId: 'cancel-delete' })
+
+  await v.press({ testId: 'logs' })
+  assert.equal(v.find(LOGS)?.props.label, '로그')
+  assert.ok(v.find({ text: /^로그 갱신/ }), v.summary().join('\n'))
+  assert.deepEqual(['로그 새로고침', '로그 닫기'].map((label) => v.find({ label })?.type), ['IconButton', 'IconButton'])
+  assert.equal(v.find(LOGS_TERMINAL)?.text, '터미널에서 열기')
+  await v.press(LOGS_TERMINAL)
+  assert.ok(v.find({ text: 'proj에 로그 터미널을 열었습니다.' }), v.summary().join('\n'))
+  assert.deepEqual(englishLeft(v), [])
+}
+
+test('follows a Korean Orca: the panel writes its own words in Korean', async () => {
+  const v = await open({}, { locale: 'ko' })
+  await assertKorean(v)
+  clean(v)
+})
+
+test('the Language setting picks Korean under an English Orca', async () => {
+  const v = await open({}, { locale: 'en-US', settings: { language: 'ko' } })
+  await assertKorean(v)
+  clean(v)
+})
+
+test('the Language setting picks English under a Korean Orca, and auto follows the Orca locale', async () => {
+  const seeds: Record<string, string | number>[] = [{ language: 'en' }, { language: 'en', refreshLocalSeconds: 5 }]
+  for (const seeded of seeds) {
+    const v = await open({}, { locale: 'ko-KR', settings: seeded })
+    assert.equal(v.find({ label: 'Host' })?.props.placeholder, 'Choose a host')
+    assert.equal(v.find(section('Containers'))?.props.description, '1 running / 2')
+    await v.selectItem(CONTAINERS, WEB)
+    assert.deepEqual(ACTIONS.map((id) => v.find({ testId: id })?.text), ['Start', 'Stop', 'Restart', 'Logs', 'Shell', 'Delete'])
+    assert.equal(drawnWords(v).some((word) => HANGUL.test(word)), false, drawnWords(v).join(' | '))
+    clean(v)
+    await v.unmount()
+    view = undefined
+  }
+  for (const [language, locale, expected] of [['auto', 'ko-KR', '호스트'], ['auto', 'en-US', 'Host'], ['fr', 'ko', '호스트']] as const) {
+    const v = await open({}, { locale, settings: { language } })
+    assert.ok(v.find({ type: 'Select', label: expected }), `${language} ${locale}: ${v.summary().join('\n')}`)
+    await v.unmount()
+    view = undefined
+  }
+})
+
+test('problems in Korean: fixed copy translated, the message of a failure as it came', async () => {
+  let v = await open({ 'docker.snapshot': () => ({ ok: false, problem: { kind: 'daemon-down', message: 'Cannot connect' } }) }, { locale: 'ko' })
+  assert.ok(v.summary().includes('EmptyState "Docker가 실행 중이 아닙니다"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: '이 호스트에서 Docker 데몬을 시작하세요.' }))
+  assert.deepEqual(englishLeft(v), [])
+  await v.unmount()
+
+  v = await open({ 'docker.snapshot': () => { throw hostError('unavailable', 'the worker stopped') } }, { locale: 'ko' })
+  assert.ok(v.summary().includes('EmptyState "명령이 실패했습니다"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: 'unavailable: the worker stopped' }))
+  await v.unmount()
+
+  const sshMessage = 'ssh to "GPU1" failed: ssh: connect to host gpu1 port 22: Operation timed out.'
+  v = await open({ 'docker.snapshot': () => ({ ok: false, problem: { kind: 'ssh-failed', message: sshMessage } }) }, { locale: 'ko' })
+  assert.ok(v.summary().includes('EmptyState "SSH 연결에 실패했습니다"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: sshMessage }))
+  await v.unmount()
+
+  // A later refresh that fails, over the last snapshot; and a host list that fails.
+  let fail = false
+  v = await open({
+    'docker.snapshot': ({ hostId }) => fail ? { ok: false, problem: { kind: 'timeout', message: 'slow' } } : ok(snap(hostId, LOCAL)),
+  }, { locale: 'ko' })
+  fail = true
+  await v.press({ label: '새로고침' })
+  assert.ok(v.summary().includes('Callout warning "시간이 초과되었습니다"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: 'Docker가 제시간에 응답하지 않았습니다.' }))
+  await v.unmount()
+
+  v = await open({ 'hosts.list': () => ({ ok: false, problem: { kind: 'unreachable', message: 'x' } }) }, { locale: 'ko' })
+  assert.ok(v.summary().includes('Callout warning "호스트에 연결할 수 없습니다"'), v.summary().join('\n'))
+  assert.deepEqual(englishLeft(v), [])
+  await v.unmount()
+
+  v = await open({ 'hosts.list': () => ok({ hosts: [{ id: 'local', label: 'Mac', kind: 'local', status: 'unsupported' }] }) }, { locale: 'ko' })
+  assert.ok(v.summary().includes('EmptyState "준비된 호스트가 없습니다"'), v.summary().join('\n'))
+  assert.ok(v.find({ text: '호스트가 준비되면 위에서 고르세요.' }))
+  assert.deepEqual(v.find({ label: '호스트' })?.props.options, [{ value: 'local', label: 'Mac (지원 안 함)', disabled: true }])
+  assert.deepEqual(englishLeft(v), [])
+  view = v
+})
+
+test('no English the panel writes is left on any Korean screen', async () => {
+  // The check finds English: an English panel shows plenty of it.
+  const english = await open()
+  assert.ok(englishLeft(english).length > 5, englishLeft(english).join(' | '))
+  await english.unmount()
+
+  const v = await open({ ...withResources, 'docker.logs': () => ok({ lines: [], takenAt: 2_000 }) }, { locale: 'ko' })
+  const seen: string[] = []
+  const scan = () => seen.push(...englishLeft(v))
+  for (const label of ['이미지', '볼륨', '네트워크']) await v.toggle(section(label))
+  scan()
+  // A container: its card, a tab that opened, its empty log view, its delete question.
+  await v.selectItem(KO_CONTAINERS, WEB)
+  await v.press({ testId: 'shell' })
+  assert.ok(v.find({ text: 'proj에 Shell을 열었습니다.' }), v.summary().join('\n'))
+  await v.press({ testId: 'logs' })
+  assert.ok(v.find({ text: '로그가 없습니다' }), v.summary().join('\n'))
+  scan()
+  await v.selectItem(KO_CONTAINERS, DB)
+  await v.press({ testId: 'delete' })
+  scan()
+  // An image tag: its card, Pull and its note, its delete question.
+  await v.selectItem({ type: 'Tree', label: '이미지' }, NGINX_LATEST)
+  assert.equal(v.find({ type: 'Toolbar' })?.label, '이미지 작업')
+  assert.deepEqual((v.find({ type: 'KeyValue' })?.props.items as { label: string }[]).map((i) => i.label), ['ID', '크기', '생성'])
+  assert.equal(v.find({ testId: 'pull' })?.text, 'Pull')
+  await v.press({ testId: 'pull' })
+  assert.ok(v.find({ text: 'proj에 nginx:latest Pull 터미널을 열었습니다.' }), v.summary().join('\n'))
+  await v.press({ testId: 'delete' })
+  assert.match(v.find({ type: 'Callout' })?.text ?? '', /태그를 삭제하고, 이미지에 다른 태그가 없으면 이미지도 삭제합니다\./)
+  scan()
+  // The pull row: a refused name, then a name it opens.
+  const pullInput = { label: 'Pull할 이미지' }
+  assert.equal(v.find(pullInput)?.props.placeholder, 'nginx:latest')
+  await v.type(pullInput, 'x;id')
+  await v.press(PULL_BY_NAME)
+  assert.ok(v.find({ text: '이미지 이름이 아닙니다. nginx:latest나 ghcr.io/org/app:1.2처럼 입력하세요.' }), v.summary().join('\n'))
+  scan()
+  await v.type(pullInput, 'redis:7', { replace: true })
+  await v.press(PULL_BY_NAME)
+  assert.ok(v.find({ text: 'proj에 redis:7 Pull 터미널을 열었습니다.' }), v.summary().join('\n'))
+  scan()
+  // A volume and its delete question; a built-in network.
+  await v.selectItem({ type: 'Tree', label: '볼륨' }, PGDATA)
+  assert.equal(v.find({ type: 'Toolbar' })?.label, '볼륨 작업')
+  await v.press({ testId: 'delete' })
+  assert.ok(v.summary().includes('Callout danger "pgdata 삭제"'), v.summary().join('\n'))
+  scan()
+  await v.selectItem({ type: 'Tree', label: '네트워크' }, BRIDGE)
+  assert.equal(v.find({ type: 'Toolbar' })?.label, '네트워크 작업')
+  assert.ok(v.find({ text: 'Docker 기본 네트워크는 삭제할 수 없습니다.' }), v.summary().join('\n'))
+  scan()
+  // A filter that leaves nothing; a host with nothing.
+  await v.type({ label: '필터' }, 'zzz')
+  assert.deepEqual(['컨테이너', '이미지', '볼륨', '네트워크'].map((noun) => v.find({ text: `필터에 맞는 ${noun}${noun === '볼륨' ? '이' : '가'} 없습니다` }) !== null), [
+    true, true, true, true,
+  ])
+  scan()
+  assert.deepEqual(seen, [])
+  clean(v)
+  await v.unmount()
+
+  const empty = await open({ 'docker.snapshot': ({ hostId }) => ok({ ...snap(hostId, []), images: [], volumes: [], networks: [] }) }, { locale: 'ko' })
+  for (const label of ['이미지', '볼륨', '네트워크']) await empty.toggle(section(label))
+  assert.deepEqual(['컨테이너가', '이미지가', '볼륨이', '네트워크가'].map((subject) => empty.find({ text: `${subject} 없습니다` }) !== null), [true, true, true, true])
+  assert.equal(empty.find(section('컨테이너'))?.props.description, '0개 중 0개 실행 중')
+  assert.deepEqual(englishLeft(empty), [])
+  view = empty
+})
+
+// The test kit settles only once every request has answered, so each handler looks at the screen while its own
+// request is still out. (The first host list answers before mount resolves, so "Loading hosts" is not seen here.)
+test('loading and working states in Korean', async () => {
+  let loading: string[] = []
+  let during: string[] = []
+  let logsSeen = false
+  const v = await open({
+    'docker.snapshot': async ({ hostId }) => {
+      if (hostId === 'ssh:GPU1') {
+        await nextTurn()
+        loading = [...englishLeft(view!), view!.find({ type: 'Skeleton', label: '컨테이너를 불러오는 중' }) === null ? 'no skeleton' : '']
+      }
+      return ok(snap(hostId, LOCAL))
+    },
+    'docker.action': async () => {
+      await nextTurn()
+      during = [...englishLeft(view!), view!.find({ type: 'Spinner', label: '작업 중' }) === null ? 'no spinner' : '']
+      return ok({ done: true as const })
+    },
+    'docker.logs': async ({ containerId }) => {
+      await nextTurn()
+      logsSeen = view!.find({ type: 'Skeleton', label: '로그를 불러오는 중' }) !== null
+      return ok({ lines: [containerId], takenAt: 2_000 })
+    },
+  }, { locale: 'ko' })
+  await v.selectItem(KO_CONTAINERS, WEB)
+  await v.press({ testId: 'logs' })
+  assert.equal(logsSeen, true)
+  await v.press({ testId: 'stop' })
+  assert.deepEqual(during, [''])
+  await v.select({ label: '호스트' }, 'ssh:GPU1')
+  assert.deepEqual(loading, [''])
+  clean(v)
+})
+
+test('switching the Language setting keeps a pending delete question and the filter text', async () => {
+  const v = await open()
+  await v.type(FILTER, 'db')
+  await v.selectItem(CONTAINERS, DB)
+  await v.press({ testId: 'delete' })
+  assert.ok(v.summary().includes('Callout danger "Delete db?"'), v.summary().join('\n'))
+  await settings.set('language', 'ko')
+  await v.settled()
+  assert.ok(v.summary().includes('Callout danger "db 삭제"'), v.summary().join('\n'))
+  assert.equal(v.valueOf({ label: '필터' }), 'db')
+  clean(v)
+})
+
+test('switching the Language setting redraws in place, keeping the selection, the log view and the sections', async () => {
+  const v = await open()
+  await v.toggle(section('Images'))
+  await v.selectItem(CONTAINERS, WEB)
+  await v.press({ testId: 'logs' })
+  await v.press({ testId: 'shell' })
+  const requestsBefore = (v.host.callsOf('plugin.request') as Sent[]).length
+  assert.ok(v.find({ text: 'Opened shell in proj.' }))
+
+  await settings.set('language', 'ko')
+  await v.settled()
+  assert.equal(v.valueOf(KO_CONTAINERS), WEB)
+  assert.equal(card(v)?.label, 'web')
+  assert.equal(v.find({ testId: 'stop' })?.text, '중지')
+  assert.equal(logCode(v), `${WEB} started\n${WEB} ready`)
+  assert.ok(v.find({ text: 'proj에 Shell을 열었습니다.' }), v.summary().join('\n'))
+  assert.deepEqual([v.valueOf(section('컨테이너')), v.valueOf(section('이미지'))], [true, true])
+  assert.deepEqual(englishLeft(v), [])
+  // Redrawing asked the worker for nothing.
+  assert.equal((v.host.callsOf('plugin.request') as Sent[]).length, requestsBefore)
+
+  await settings.set('language', 'auto')
+  await v.settled()
+  assert.equal(v.valueOf(CONTAINERS), WEB)
+  assert.equal(v.find({ testId: 'stop' })?.text, 'Stop')
+  assert.ok(v.find({ text: 'Opened shell in proj.' }))
+  assert.equal(drawnWords(v).some((word) => HANGUL.test(word)), false, drawnWords(v).join(' | '))
   clean(v)
 })
